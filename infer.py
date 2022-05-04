@@ -3,12 +3,23 @@ import argparse #ArgumentParser, BooleanOptionalAction
 from tabulate import tabulate
 from datetime import datetime
 
-import simclr, moco, simsiam, byol, barlow_twins, cumi, mdmi
-from dataloader_modules import CIFAR10ArrayDataModule, CIFAR100DataModule, STL10DataModule, TinyImageNetDataModule
+#import torch
+import torch.nn as nn
+
+#import simclr, moco, simsiam, byol, barlow_twins, cumi, mdmi
+from dataloaders import MRNetDataModule #CIFAR10ArrayDataModule, CIFAR100DataModule, STL10DataModule, TinyImageNetDataModule
 from trainer import Trainer
 from utils import run_command
 from model_utils import ClassificationModel
-from model_transforms import *
+from transformations import *
+
+
+class DummyModel(nn.Module):
+    def __init__(self, model_name, base_encoder_name):
+        super().__init__()
+        self.model_name = model_name
+        self.base_encoder_name = base_encoder_name
+        self.pretrain_batch_size = 2
 
 def main(args):
 
@@ -24,8 +35,8 @@ def main(args):
     if not os.path.exists(args.modelsavepath):
         os.makedirs(args.modelsavepath)
 
-    if args.dataset=='cifar10' or args.dataset=='cifar100':
-        args.data_dims = '32x32' if args.data_dims is None else args.data_dims
+    # if args.dataset=='cifar10' or args.dataset=='cifar100':
+    #     args.data_dims = '32x32' if args.data_dims is None else args.data_dims
 
     # if args.model_name == 'simclr':
     #     model = simclr.SimCLRModel(**dict_args)
@@ -67,38 +78,21 @@ def main(args):
     #     transforms = SimCLRTransform(0.5, int(args.data_dims.split('x')[0]))
 
 
-    if args.dataset == 'cifar10':
-        dm = CIFAR10ArrayDataModule(args.pretrain_batch_size,
-                               args.other_batch_size,
-                               args.download,
-                               args.dataset_path,
-                               transforms
-                               )
-    elif args.dataset == 'cifar100':
-        dm = CIFAR100DataModule(args.pretrain_batch_size,
-                               args.other_batch_size,
-                               args.download,
-                               args.dataset_path,
-                               transforms
-                               )
-    elif args.dataset == 'stl10':
-        dm = STL10DataModule(args.pretrain_batch_size,
-                           args.other_batch_size,
-                           args.download,
-                           args.dataset_path,
-                           transforms
-                           )
+    if args.dataset == 'mrnet':
+        class_name = 'acl' #input("Enter class name : [acl / abn / men] : ")
+        plane = 'sagittal' #input("Enter class name : [sagittal / coronal / axial] : ")
+        dm = MRNetDataModule(args.dataset_path,
+                             class_name,
+                             plane,
+                             args.pt_num_frames,
+                             args.ds_num_frames,
+                             args.acc_bs,
+                             2,
+                             None)
 
-    elif args.dataset == 'tinyimagenet':
-        dm = TinyImageNetDataModule(args.pretrain_batch_size,
-                                    args.other_batch_size,
-                                    args.download,
-                                    args.dataset_path,
-                                    transforms
-                                    )
-
-    trainer = Trainer(None,
-                      dm,
+    trainer = Trainer(args.run_num,
+                      DummyModel(args.model_name, args.base_encoder_name),
+                      datamodule = dm,
                       max_epochs = None, #args.max_epochs,
                       train_epochs = None, #args.train_epochs,
                       lineval_epochs = args.lineval_epochs,
@@ -125,21 +119,24 @@ def main(args):
     #BUILD A MODEL FOR THE DOWNSTREAM TASK
     ds_model = ClassificationModel(args.base_encoder_name,
                                    dm.num_classes, 
-                                   args.data_dims).to('cuda:0')
+                                   args.data_dims,
+                                   classification_type = 'binary',
+                                   bin_pos_wts = 4.4327).to('cuda:0')
     #KNN EVALUATION
-    knn_eval_metrics = trainer.knn_eval(ds_model, 
-                                        fracs = args.knn_fracs, 
-                                        k = args.num_neighbours, 
-                                        weights = args.knn_wt_type, 
-                                        algorithm = args.knn_algo_type, 
-                                        metric = args.knn_metric_type)
+    # knn_eval_metrics = trainer.knn_eval(ds_model, 
+    #                                     fracs = args.knn_fracs, 
+    #                                     k = args.num_neighbours, 
+    #                                     weights = args.knn_wt_type, 
+    #                                     algorithm = args.knn_algo_type, 
+    #                                     metric = args.knn_metric_type,
+    #                                     net_model_path = args.model_path)
     # LINEAR EVALUATION
     #ds_model = ClassificationModel('resnet18',dm.num_classes).to('cuda:0')
-    lin_eval_metrics = trainer.linear_eval(ds_model, net_model_path = args.model_path, mode = 'infer')
+    #lin_eval_metrics = trainer.linear_eval(ds_model, net_model_path = args.model_path, mode = 'train')
     #FINE TUNING
-    #fine_tune_metrics = trainer.fine_tune(ds_model)
+    fine_tune_metrics = trainer.fine_tune(dsmodel = ds_model, net_model_path = args.model_path, mode = 'train')
 
-    metrics_dict = {**knn_eval_metrics, **lin_eval_metrics} #, **fine_tune_metrics}
+    metrics_dict = fine_tune_metrics #lin_eval_metrics #{**knn_eval_metrics, **lin_eval_metrics} #, **fine_tune_metrics}
     # print(metrics_dict)
     # print(dict_args)
     trainer.writer.add_hparams(dict_args, metrics_dict,
@@ -147,8 +144,13 @@ def main(args):
                                                     args.base_encoder_name,
                                                     'inference', date]))
 
+    #trainer.extract_embeddings(ds_model, args.model_path, trainer.test_loader, trainer.writer)
+
+    trainer.writer.close()
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--run_num',type=str,default=None)
     parser.add_argument('--gpus',type=int,default=1)
     parser.add_argument('--pretrain',action='store_false',help = 'Stage of learning')
     parser.add_argument('--model_name',type=str,default='simclr',help = 'Name of Algorithm or Framework')
@@ -221,6 +223,12 @@ if __name__ == '__main__':
     # parser.add_argument('--lr_milestones', type=str, default=None)
     # parser.add_argument('--lr_factor', type=float, default=None)
     # parser.add_argument('--lr_total_iters', type=int, default=None)
+
+    parser.add_argument('--grad_acc', action = 'store_true')
+    parser.add_argument('--acc_bs', type = int, default = 1)
+
+    parser.add_argument('--pt_num_frames', type=int, default=16)
+    parser.add_argument('--ds_num_frames', type=int, default=16)
 
 
     args = parser.parse_args()

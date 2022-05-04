@@ -37,7 +37,7 @@ class Trainer(nn.Module):
                  modelsaveinterval: int = 1,
                  resume: bool = False,
                  model_path: str = None,
-                 show_valid_metrics: bool = False,
+                 show_valid_metrics: bool = True,
                  lowest_val_eval: bool = False,
                  **kwargs: Any) -> None:
         super().__init__()
@@ -246,6 +246,7 @@ class Trainer(nn.Module):
                         dsmodel.load_state_dict(torch.load(self.final_net_save_path), strict = False)
 
                 metrics = self.train_classifier('fine_tune',
+                                                'train',
                                               dsmodel,
                                               False, fracs,
                                               self.finetune_epochs,
@@ -301,7 +302,7 @@ class Trainer(nn.Module):
                     summary_writer: Any) -> int:
         model.eval()
         valid_losses = 0
-        features = np.array([]).reshape((0,self.model.projector_out_dim if not hasattr(self.model,'predictor_out_dim') or self.model.predictor_out_dim is None else self.model.predictor_out_dim))
+        features = np.array([]).reshape((0,self.model.net.projector.in_features)) #_out_dim if not hasattr(self.model,'predictor_out_dim') or self.model.predictor_out_dim is None else self.model.predictor_out_dim))
         labels = np.array([])
         with torch.no_grad():
             with tqdm(dataloader, unit = 'batch', total = len(dataloader)) as vepoch:
@@ -319,7 +320,7 @@ class Trainer(nn.Module):
                        stage: str,
                        mode: str,
                        model: nn.Module,
-                       linear_eval: str,
+                       linear_eval: bool,
                        fracs: float = 1.0,
                        ds_epochs: int = 100,
                        patience: int = 5,
@@ -385,6 +386,8 @@ class Trainer(nn.Module):
 
         if optim == 'sgd':
             optimizer = torch.optim.SGD(parameters, lr = lr, momentum = momentum)
+        if optim == 'adam':
+            optimizer = torch.optim.Adam(parameters, lr = lr)
 
         #CHANGE SCHEDULER LATER
         if scheduler == 'steplr':
@@ -400,7 +403,7 @@ class Trainer(nn.Module):
                                                                        verbose = True)
         elif scheduler == 'multistep':
             lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                                milestones = [60, 80],
+                                                                milestones = [int(0.6*ds_epochs), int(0.80*ds_epochs)],
                                                                 gamma = 0.1,
                                                                 verbose = True)
         self.train_losses, self.valid_losses = np.array([]), np.array([])
@@ -425,13 +428,12 @@ class Trainer(nn.Module):
             self.train_losses = np.append(self.train_losses, train_epoch_loss)
             self.train_accuracy = np.append(self.train_accuracy, train_epoch_accuracy)
             lr_scheduler.step()
-            val_epoch_loss, val_epoch_accuracy, preds, gts = self.valid_ds_epoch(self.evaluation_model,
-                                                                    self.valid_loader)
+            val_epoch_loss, val_epoch_accuracy, preds, gts = self.valid_ds_epoch(self.evaluation_model,self.valid_loader)
             self.valid_losses = np.append(self.valid_losses, val_epoch_loss)
             self.valid_accuracy = np.append(self.valid_accuracy, val_epoch_accuracy)
 
             self.writer.add_scalar('/'.join([stage,str(fracs).replace('.','p'),'Loss','valid']),val_epoch_loss,epoch)
-            self.writer.add_scalar('/'.join([stage,str(fracs).replace('.','p'),'Accuracy','valid']),val_epoch_accuracy,epoch)
+            self.writer.add_scalar('/'.join([stage,str(fracs).replace('.','p'),'Accuracy','valid']),val_epoch_accuracy, epoch)
             print("\nTrain Accuracy : {acc:.5f}, Train Loss : {loss:.5f}".format(acc = train_epoch_accuracy, loss = train_epoch_loss), flush = True)
             print("\nValid Accuracy : {acc:.5f}, Valid Loss : {loss:.5f}".format(acc = val_epoch_accuracy, loss = val_epoch_loss), flush = True)
             
@@ -445,7 +447,7 @@ class Trainer(nn.Module):
                     self.dsfilepath = '/'.join([self.modelsavepath,'_'.join([self.model_name, 'linear_eval', self.datestr, '.pt'])])
                     torch.save(self.evaluation_model.state_dict(), self.dsfilepath)
                 else:
-                    self.dsfilepath = '/'.join([self.modelsavepath,'_'.join([self.model_name, 'fine_tune', fracs.replace('.','p'), self.datestr, '.pt'])])
+                    self.dsfilepath = '/'.join([self.modelsavepath,'_'.join([self.model_name, 'fine_tune', str(fracs).replace('.','p'), self.datestr, '.pt'])])
                     torch.save(self.evaluation_model.state_dict(), self.dsfilepath)
             else:
                 counter+=1
@@ -540,14 +542,14 @@ class Trainer(nn.Module):
         train_accuracy = 0
         with tqdm(dataloader, unit = 'batch', total = len(dataloader)) as tepoch:
             for step, batch in enumerate(tepoch):
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none = True )
                 train_loss, train_acc, _, _ = model.step(batch, step, False)
                 #self.writer.add_scalar('pretrain/train_loss_step',train_loss)
                 train_loss.backward()
                 optimizer.step()
                 train_losses += train_loss.item()
                 train_accuracy += train_acc
-                tepoch.set_postfix(loss = train_losses/(step+1), acc = train_accuracy/(step+1))
+                tepoch.set_postfix(loss = train_loss.item(), acc = train_accuracy/(step+1))
         train_losses = train_losses/(step+1)
         train_accuracy =train_accuracy/(step+1)
         return train_losses, train_accuracy
@@ -569,7 +571,7 @@ class Trainer(nn.Module):
                     #self.writer.add_scalar('pretrain/train_loss_step',train_loss)
                     valid_losses += valid_loss.item()
                     valid_accuracy += valid_acc
-                    vepoch.set_postfix(loss = valid_losses/(step+1), acc = valid_accuracy/(step+1))
+                    vepoch.set_postfix(loss = valid_loss.item(), acc = valid_accuracy/(step+1))
             valid_losses = valid_losses/(step+1)
             valid_accuracy = valid_accuracy/(step+1)
         return valid_losses, valid_accuracy, preds, gts
@@ -713,8 +715,12 @@ class Trainer(nn.Module):
                                           weights = self.knn_weights,
                                           algorithm = self.knn_algorithm,
                                           metric = self.knn_metric)
+            tgts = tgts[~np.isnan(tpreds)[:,0]]
+            tpreds = tpreds[~np.isnan(tpreds)[:,0]]
             _ = knnclf.fit(tpreds, tgts)
-
+            # print(vpreds)
+            vgts = vgts[~np.isnan(vpreds)[:,0]]
+            vpreds = vpreds[~np.isnan(vpreds)[:,0]]
             test_acc = knnclf.score(vpreds, vgts)
 
         else:
@@ -745,3 +751,28 @@ class Trainer(nn.Module):
         
         return {'_'.join([stage,'k='+str(k),str(fracs).replace('.','p'),'test_acc']):test_acc}
 
+    def extract_embeddings(self,
+                           model,
+                           model_path,
+                           dataloader,
+                           writer):
+        if model_path is None:
+            model.load_state_dict(torch.load(self.final_net_save_path), strict = False)
+        else:
+            model.load_state_dict(torch.load(model_path), strict = False)
+
+        features = None
+        labels = None
+        labels_img = None
+        with torch.no_grad():
+            for x,y in dataloader:
+                feats = model(x.cuda(non_blocking = True))
+                if features == None:
+                    features = feats.cpu().numpy()
+                    labels = y
+                    label_img = x.cpu().numpy().transpose(0,2,3,1)
+                else:
+                    features = np.append(features, feats.cpu().numpy(), axis = 0)
+                    labels = np.append(labels, y, axis = 0)
+                    labels_img = np.append(label_img, x.cpu().numpy().transpose(0,2,3,1), axis = 0)
+        writer.add_embedding(features = features, metadata = labels, label_img = label_img)

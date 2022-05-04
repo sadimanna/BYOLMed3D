@@ -91,14 +91,14 @@ class ClassificationModel(nn.Module):
         self.eval_type = eval_type
 
         self.base_enc_out = None
-        # if self.num_classes == 2 and self.classification_type == 'binary':
-        #     num_classes = 1
-        # elif self.num_classes == 2 and self.classification_type == 'multi-label':
-        #     num_classes = 2
-        # else:
-        #     num_classes = self.model.num_classes
+        if self.num_classes == 2 and self.classification_type == 'binary':
+            num_classes = 1
+        elif self.num_classes == 2 and self.classification_type == 'multi-label':
+            num_classes = 2
+        else:
+            num_classes = self.model.num_classes
         
-        self.base_encoder = models.video.r3d_18(num_classes = self.num_classes)
+        self.base_encoder = models.video.r3d_18(num_classes = num_classes)
         
         if self.data_dims.split('x')[0] == '32':
             self.base_encoder.conv1 = nn.Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), bias=False)
@@ -114,7 +114,7 @@ class ClassificationModel(nn.Module):
         if self.classification_type == 'multi-class':
             self.criterion = nn.CrossEntropyLoss()
         elif self.classification_type in ['binary','multi-label']:
-            self.criterion = nn.BCEWithLogitsLoss(pos_weight = self.bin_pos_wts)
+            self.criterion = nn.BCEWithLogitsLoss(pos_weight = torch.Tensor([self.bin_pos_wts]))
 
         #if stage == 'lineval':
         #    for p in self.base_encoder
@@ -131,7 +131,7 @@ class ClassificationModel(nn.Module):
         return self.base_encoder(x)
 
     def step(self, batch, batch_idx, knn = True):
-        x, y = [b.to('cuda:0') for b in batch]
+        x, y = [b.cuda(non_blocking = True) for b in batch]
         # pass throught net
         z = self.base_encoder(x)
         
@@ -144,14 +144,14 @@ class ClassificationModel(nn.Module):
             loss = self.criterion(z,y)
 
             if self.classification_type == 'multi-class':
-                preds = torch.exp(z.cpu().data)/torch.sum(torch.exp(z.cpu().data), dim = 1, keepdims = True)
+                preds = torch.exp(z.cpu())/torch.sum(torch.exp(z.cpu()), dim = 1, keepdims = True)
                 _, preds = torch.max(preds, dim = 1)
             else:
                 preds = (z.cpu().data >= 0.5)
         
-            acc = (preds == y.cpu().data).to(dtype = torch.float64).mean().item()
+            acc = (preds == y.cpu()).to(dtype = torch.float64).mean().item()
             #self.log('train_loss_ssl',loss, on_epoch = True, logger = True)
-            return loss, acc, z.cpu().data, y.cpu().data
+            return loss, acc, z.cpu(), y.cpu()
         else:
-            return self.base_enc_out.cpu().data, y.cpu().data
+            return self.base_enc_out.cpu(), y.cpu()
 
