@@ -75,10 +75,10 @@ class BYOLNet(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.base_encoder(x)
-        x = self.projector(x)
+        z = self.projector(x)
         if self.online:
-            x = self.predictor(x)
-        return x
+            z = self.predictor(z)
+        return x, z
 
 class BYOLModel(nn.Module):
     def __init__(self,
@@ -94,7 +94,7 @@ class BYOLModel(nn.Module):
                  warmup_start_lr: float = 1e-5,
                  eta_min: float = 1e-5,
                  pretrain_batch_size: int = 64,
-                 other_batch_size: int = 32,
+                 ds_batch_size: int = 32,
                  temperature: float = 0.5,
                  projector_type: str = 'nonlinear',
                  proj_num_layers: int = 2,
@@ -126,7 +126,7 @@ class BYOLModel(nn.Module):
         self.warmup_start_lr = warmup_start_lr
         self.eta_min = eta_min
 
-        self.other_batch_size = other_batch_size
+        self.ds_batch_size = ds_batch_size
         self.temperature = temperature
 
         self.projector_type = projector_type
@@ -210,19 +210,19 @@ class BYOLModel(nn.Module):
 
     def forward(self, im_o, im_t):
         # compute query features
-        o1 = self.net(im_o)
-        t1 = self.net(im_t)
+        e1, o1 = self.net(im_o)
+        _, t1 = self.net(im_t)
         # queries: NxC
         # compute key features
         with torch.no_grad():  # no gradient to keys
             self._momentum_update_target_encoder()  # update the key encoder
             # shuffle for making use of BN
             #im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
-            o2 = self.net_t(im_o)
-            t2 = self.net_t(im_t)  # keys: NxC
+            _, o2 = self.net_t(im_o)
+            _, t2 = self.net_t(im_t)  # keys: NxC
             # undo shuffle
             #k = self._batch_unshuffle_ddp(k, idx_unshuffle)
-        return (o1, t1), (o2, t2)
+        return e1, (o1, t1), (o2, t2)
 
     def configure_optimizers(self):
         if self.bn_bias_lr is not None:
@@ -308,7 +308,7 @@ class BYOLModel(nn.Module):
         # plt.imshow(x1.cpu().numpy()[0,:,0,:,:].transpose(1,2,0)*0.1087 + 0.1593)
         # plt.show()
         #  pass throught net
-        (o1, t1), (o2, t2) = self(x1, x2)
+        e1, (o1, t1), (o2, t2) = self(x1, x2)
         # print(o1)
         #print(q.shape,k.shape)
         loss1 = self.criterion(o1, t2, batch_idx, summary_writer, stage)        
@@ -319,4 +319,4 @@ class BYOLModel(nn.Module):
         if stage == 'train':
             return loss
         else:
-            return o1.cpu().numpy(), y.cpu().numpy(), loss #.cpu().item()
+            return e1.cpu().numpy(), y.cpu().numpy(), loss #.cpu().item()
