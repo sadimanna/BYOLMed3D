@@ -117,7 +117,7 @@ class BYOLModel(nn.Module):
         self.optim = optim
         self.pretrain_batch_size = pretrain_batch_size
         self.base_lr = 0.2
-        self.lr = min(self.base_lr*self.pretrain_batch_size/256, lr)
+        self.lr = lr #min(self.base_lr*self.pretrain_batch_size/256, lr) if self.pretrain_batch_size >= 256 else self.base_lr
         self.lr_scheduler = lr_scheduler
         self.momentum = momentum
         self.weight_decay = weight_decay
@@ -208,14 +208,15 @@ class BYOLModel(nn.Module):
         for param_o, param_t in zip(self.net.parameters(), self.net_t.parameters()):
             param_t.data = param_t.data * self.m + param_o.data * (1. - self.m)
 
-    def forward(self, im_o, im_t):
+    def forward(self, im_o, im_t, update_mom = False):
         # compute query features
         e1, o1 = self.net(im_o)
         _, t1 = self.net(im_t)
         # queries: NxC
         # compute key features
         with torch.no_grad():  # no gradient to keys
-            self._momentum_update_target_encoder()  # update the key encoder
+            if update_mom:
+                self._momentum_update_target_encoder()  # update the key encoder
             # shuffle for making use of BN
             #im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
             _, o2 = self.net_t(im_o)
@@ -277,6 +278,14 @@ class BYOLModel(nn.Module):
                                                             total_iters=self.max_epochs, 
                                                             last_epoch=- 1, 
                                                             verbose=True)
+
+        elif self.lr_scheduler == 'cadec':
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 
+                                                                   self.max_epochs, 
+                                                                   eta_min=0, 
+                                                                   last_epoch=- 1, 
+                                                                   verbose=True)
+
         elif self.lr_scheduler == 'step':
             scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
                                                         step_size = self.kwargs['step_size'] if self.kwargs['step_size'] is not None else 10,
@@ -303,12 +312,12 @@ class BYOLModel(nn.Module):
 
         return optimizer, scheduler
 
-    def step(self, stage, batch, batch_idx, summary_writer = None):
+    def step(self, stage, batch, batch_idx, update_mom, summary_writer = None):
         x1, x2, y = [b.cuda(non_blocking = True) for b in batch]
         # plt.imshow(x1.cpu().numpy()[0,:,0,:,:].transpose(1,2,0)*0.1087 + 0.1593)
         # plt.show()
         #  pass throught net
-        e1, (o1, t1), (o2, t2) = self(x1, x2)
+        e1, (o1, t1), (o2, t2) = self(x1, x2, update_mom)
         # print(o1)
         #print(q.shape,k.shape)
         loss1 = self.criterion(o1, t2, batch_idx, summary_writer, stage)        

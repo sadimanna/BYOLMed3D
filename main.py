@@ -12,7 +12,7 @@ import torch.nn.functional as tF
 import torch.optim as optim
 from torchvision import datasets, transforms, models
 
-from torchvision.models.utils import load_state_dict_from_url
+# from torchvision.models.utils import load_state_dict_from_url
 
 from sklearn.model_selection import train_test_split
 
@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 
 from dataloaders import MRNetDataModule
 from transformations import *
-from model_utils import ProjectionHead
+from model_utils import ClassificationModel
 import losses
 import byol3d
 from trainer import Trainer
@@ -159,7 +159,10 @@ if __name__ == '__main__':
                              args.ds_num_frames,
     						 args.acc_bs,
                              args.ds_batch_size,
-    						 transforms_)
+    						 transforms_,
+                             224,
+                             dsoversample = True,
+                             dsbinary = True)
 
     # =============================================================================
 
@@ -205,29 +208,30 @@ if __name__ == '__main__':
     #BUILD A MODEL FOR THE DOWNSTREAM TASK
     ds_model = ClassificationModel(args.base_encoder_name,
                                    dm.num_classes, 
-                                   args.data_dims).to('cuda:0')
+                                   args.data_dims,
+                                   classification_type = 'binary').to('cuda:0')
 
     # =============================================================================
     #KNN EVALUATION
-    knn_eval_metrics = trainer.knn_eval(ds_model, 
-                                        fracs = args.knn_fracs, 
-                                        k = args.num_neighbours, 
-                                        weights = args.knn_wt_type, 
-                                        algorithm = args.knn_algo_type, 
-                                        metric = args.knn_metric_type)
+    # knn_eval_metrics = trainer.knn_eval(ds_model, 
+    #                                     fracs = args.knn_fracs, 
+    #                                     k = args.num_neighbours, 
+    #                                     weights = args.knn_wt_type, 
+    #                                     algorithm = args.knn_algo_type, 
+    #                                     metric = args.knn_metric_type)
 
     # =============================================================================
     # LINEAR EVALUATION
     #ds_model = ClassificationModel('resnet18',dm.num_classes).to('cuda:0')
-    lin_eval_metrics = trainer.linear_eval(ds_model)
+    # lin_eval_metrics = trainer.linear_eval(ds_model)
 
     # =============================================================================
     #FINE TUNING
-    #fine_tune_metrics = trainer.fine_tune(ds_model)
+    fine_tune_metrics = trainer.fine_tune(ds_model)
 
     # =============================================================================
 
-    metrics_dict = {**knn_eval_metrics, **lin_eval_metrics} #, **fine_tune_metrics}
+    metrics_dict = {**fine_tune_metrics} # {**knn_eval_metrics, **lin_eval_metrics, 
     # print(metrics_dict)
     # print(dict_args)
 

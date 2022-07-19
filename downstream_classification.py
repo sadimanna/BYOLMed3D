@@ -29,80 +29,23 @@ def main(args):
     if not os.path.exists(args.dataset_path):
         os.makedirs(args.dataset_path)
     if not os.path.exists(args.modelsavepath):
-        os.makedirs(args.modelsavepath)
+        os.makedirs(args.modelsavepath)    
 
-    if args.dataset=='cifar10' or args.dataset=='cifar100':
-        args.data_dims = '32x32' if args.data_dims is None else args.data_dims
+    if args.dataset == 'mrnet':
+        class_name = 'acl' #input("Enter class name : [acl / abn / men] : ")
+        plane = 'sagittal' #input("Enter class name : [sagittal / coronal / axial] : ")
+        dm = MRNetDataModule(args.dataset_path,
+                             class_name,
+                             plane,
+                             args.pt_num_frames,
+                             args.ds_num_frames,
+                             args.acc_bs,
+                             args.ds_batch_size,
+                             transforms_,
+                             224,
+                             dsoversample = True,
+                             dsbinary = True)
 
-    # if args.model_name == 'simclr':
-    #     model = simclr.SimCLRModel(**dict_args)
-    #     transforms = SimCLRTransform(0.5,int(args.data_dims.split('x')[0]))
-    #     #checkpoint_callback = ModelCheckpoint(dirpath = args.modelsavepath,
-    #     #                                      period = args.modelsaveinterval,
-    #     #                                      filename = '_'.join([args.model_name,args.dataset,args.base_encoder_name,args.optimizer]))
-    # elif args.model_name == 'mocov1' or args.model_name == 'mocov2':
-    #     model = moco.MoCoModel(**dict_args)
-    #     if args.model_name == 'mocov1':
-    #         transforms = MoCov1Transform(int(args.data_dims.split('x')[0]))
-    #     else:
-    #         transforms = MoCov2Transform(int(args.data_dims.split('x')[0]))
-
-    # elif args.model_name == 'simsiam':
-    #     model = simsiam.SimSiamModel(**dict_args)
-    #     transforms = SimCLRTransform(0.5,int(args.data_dims.split('x')[0]))
-
-    # elif args.model_name == 'byol':
-    #     model = byol.BYOLModel(**dict_args)
-    #     transforms = BYOLTransform(int(args.data_dims.split('x')[0]))
-
-    # elif args.model_name == 'barlow_twins':
-    #     # if dict_args['bn_bias_lr'] is None:
-    #     #     dict_args['bn_bias_lr'] = 0.0048
-    #     # if dict_args['lambd'] is None:
-    #     #     dict_args['lambd'] = 0.0051
-    #     # if dict_args['ft_fc_lr'] is None:
-    #     #     dict_args['ft_fc_lr'] = 0.5
-    #     model = barlow_twins.BTModel(**dict_args)
-    #     transforms = BTTransform(int(args.data_dims.split('x')[0]))
-
-    # elif args.model_name == 'cumi':
-    #     model = cumi.CUMIModel(**dict_args)
-    #     transforms = SimCLRTransform(0.5, int(args.data_dims.split('x')[0]))
-
-    # elif args.model_name == 'mdmi':
-    #     model = mdmi.MDMIModel(**dict_args)
-    #     transforms = SimCLRTransform(0.5, int(args.data_dims.split('x')[0]))
-
-
-    if args.dataset == 'cifar10':
-        dm = CIFAR10ArrayDataModule(args.pretrain_batch_size,
-                               args.other_batch_size,
-                               args.download,
-                               args.dataset_path,
-                               transforms
-                               )
-    elif args.dataset == 'cifar100':
-        dm = CIFAR100DataModule(args.pretrain_batch_size,
-                               args.other_batch_size,
-                               args.download,
-                               args.dataset_path,
-                               transforms
-                               )
-    elif args.dataset == 'stl10':
-        dm = STL10DataModule(args.pretrain_batch_size,
-                           args.other_batch_size,
-                           args.download,
-                           args.dataset_path,
-                           transforms
-                           )
-
-    elif args.dataset == 'tinyimagenet':
-        dm = TinyImageNetDataModule(args.pretrain_batch_size,
-                                    args.other_batch_size,
-                                    args.download,
-                                    args.dataset_path,
-                                    transforms
-                                    )
 
     trainer = Trainer(args.run_num,
                       DummyModel(args.model_name, args.base_encoder_name),
@@ -133,22 +76,23 @@ def main(args):
     #BUILD A MODEL FOR THE DOWNSTREAM TASK
     ds_model = ClassificationModel(args.base_encoder_name,
                                    dm.num_classes, 
-                                   args.data_dims).to('cuda:0')
+                                   args.data_dims,
+                                   classification_type = 'binary').to('cuda:0')
     #KNN EVALUATION
-    knn_eval_metrics = trainer.knn_eval(ds_model, 
-                                        fracs = args.knn_fracs, 
-                                        k = args.num_neighbours, 
-                                        weights = args.knn_wt_type, 
-                                        algorithm = args.knn_algo_type, 
-                                        metric = args.knn_metric_type,
-                                        net_model_path = args.model_path)
+    # knn_eval_metrics = trainer.knn_eval(ds_model, 
+    #                                     fracs = args.knn_fracs, 
+    #                                     k = args.num_neighbours, 
+    #                                     weights = args.knn_wt_type, 
+    #                                     algorithm = args.knn_algo_type, 
+    #                                     metric = args.knn_metric_type,
+    #                                     net_model_path = args.model_path)
     # LINEAR EVALUATION
     #ds_model = ClassificationModel('resnet18',dm.num_classes).to('cuda:0')
-    lin_eval_metrics = trainer.linear_eval(ds_model, net_model_path = args.model_path, mode = 'infer')
+    # lin_eval_metrics = trainer.linear_eval(ds_model, net_model_path = args.model_path, mode = 'train')
     #FINE TUNING
-    #fine_tune_metrics = trainer.fine_tune(ds_model, net_model_path = args.model_path, mode = 'train')
+    fine_tune_metrics = trainer.fine_tune(ds_model, net_model_path = args.model_path, mode = 'train')
 
-    metrics_dict = {**knn_eval_metrics, **lin_eval_metrics} #, **fine_tune_metrics}
+    metrics_dict = {**fine_tune_metrics} #{**knn_eval_metrics, **lin_eval_metrics} #, 
     # print(metrics_dict)
     # print(dict_args)
     trainer.writer.add_hparams(dict_args, metrics_dict,

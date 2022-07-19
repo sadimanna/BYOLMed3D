@@ -69,7 +69,7 @@ class Trainer(nn.Module):
         self.grad_acc = grad_acc
         self.batch_size = self.model.pretrain_batch_size
         self.acc_bs = acc_bs
-        self.acc_iter = self.batch_size // self.acc_bs
+        self.acc_iter = self.batch_size // self.acc_bs if self.grad_acc else 1
         
         self.ds_num_classes = None
 
@@ -195,7 +195,7 @@ class Trainer(nn.Module):
         print("::::::::::::::::::LINEAR EVALUATION INFERENCE::::::::::::::::::")
         if mode == 'train':
             if net_model_path is not None:
-                dsmodel.load_state_dict(torch.load(net_model_path)['model_state_dict'], strict = False)
+                dsmodel.load_state_dict(torch.load(net_model_path), strict = False)
             else:
                 if self.lowest_val_eval:
                     dsmodel.load_state_dict(torch.load(self.lowest_val_model_path), strict = False)
@@ -232,13 +232,13 @@ class Trainer(nn.Module):
                   mode: str = 'train'
                  ) -> Any:
         metrics_dict = {}
-        for fracs in [0.01, 0.1, 0.25, 0.5, 1.0]:
+        for fracs in [1.0]:
 
             if mode == 'train':
                 print(":::::::::::::Semi-Supervised Fine-Tuning for {frac:.5f}% of Training Data::::::::::::".format(frac=fracs*100), flush = True)
                 #LOAD FINAL MODEL
                 if net_model_path is not None:
-                    dsmodel.load_state_dict(torch.load(net_model_path)['model_state_dict'], strict = False)
+                    dsmodel.load_state_dict(torch.load(net_model_path), strict = False)
                 else:
                     if self.lowest_val_eval:
                         dsmodel.load_state_dict(torch.load(self.lowest_val_model_path), strict = False)
@@ -283,13 +283,13 @@ class Trainer(nn.Module):
         with tqdm(dataloader, unit = 'batch', total = len(dataloader)) as tepoch:
             optimizer.zero_grad(set_to_none = True)
             for step, batch in enumerate(tepoch):
-                train_loss = model.step('train', batch, epoch*len(dataloader)+step, summary_writer)/self.acc_iter
+                train_loss = model.step('train', batch, epoch*len(dataloader)+step, True if (step==0 or step%self.acc_iter==0) else False, summary_writer)/self.acc_iter
                 #self.writer.add_scalar('pretrain/train_loss_step',train_loss)
                 train_loss.backward()
                 train_losses += train_loss.item()
                 #print(train_losses)
                 tepoch.set_postfix(loss = self.acc_iter*train_loss.item())
-                if self.grad_acc and ((step+1)%self.acc_iter==0 or (step+1)==len(dataloader)):
+                if ((step+1)%self.acc_iter==0 or (step+1)==len(dataloader)):
                     optimizer.step()
                     optimizer.zero_grad(set_to_none = True)
         train_losses = train_losses/(step+1)
@@ -389,6 +389,13 @@ class Trainer(nn.Module):
         if optim == 'adam':
             optimizer = torch.optim.Adam(parameters, lr = lr)
 
+        # ======== ONLY FOR BINARY AND MULTILABEL CLASSIFICATION FOR IMBALNACED DATASETS
+        self.evaluation_model.bin_pos_wts = self.datamodule.traingen.bin_pos_wts
+        if self.evaluation_model.classification_type in ['binary','multi-label'] and not self.datamodule.dsoversample:
+            self.evaluation_model.criterion = nn.BCEWithLogitsLoss(pos_weight = self.bin_pos_wts)
+        elif self.evaluation_model.classification_type == 'multi-class' and not self.datamodule.dsoversample:
+            self.evaluation_model.criterion = nn.CrossEntropyLoss(weight = self.bin_pos_wts)
+
         #CHANGE SCHEDULER LATER
         if scheduler == 'steplr':
             lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
@@ -460,6 +467,9 @@ class Trainer(nn.Module):
         ## LOADING THE BEST MODEL
         self.evaluation_model.load_state_dict(torch.load(self.dsfilepath))
         test_loss, test_acc, preds, gts = self.valid_ds_epoch(self.evaluation_model, self.test_loader)
+
+        preds = preds.reshape((-1,5)).mean(axis = 1, keepdims = True)
+        gts = gts.reshape((-1,5)).mean(axis = 1, keepdims = True)
         
         print(':::::Saving Predictions and One Hot Ground Truth data to \'.npy\' files:::::::')
         np.save('test_set_preds.npy', preds)
@@ -776,3 +786,7 @@ class Trainer(nn.Module):
                     labels = np.append(labels, y, axis = 0)
                     labels_img = np.append(label_img, x.cpu().numpy().transpose(0,2,3,1), axis = 0)
         writer.add_embedding(features = features, metadata = labels, label_img = label_img)
+
+
+
+

@@ -66,32 +66,32 @@ class BYOLTransform:
     def __init__(self, l):
         self.l = l
         self.transform = transforms.Compose([
-            transforms.RandomResizedCrop(self.l, (0.2,1.0)),
-            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomResizedCrop(self.l, (0.5,1.0)),
+            transforms.RandomHorizontalFlip(p=0.0),
             transforms.RandomApply(
                 [transforms.ColorJitter(brightness=0.4, contrast=0.4,
                                         saturation=0.2, hue=0.1)],
                 p=0.8
             ),
-            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomGrayscale(p=0.0),
             transforms.RandomApply([transforms.GaussianBlur(kernel_size=int(l//10) if int(l//10)%2!=0 else int(l//10)+1,
                                                             sigma=(0.8,2.0))],
-                                   p=1.0),
+                                   p=0.6),
             transforms.RandomSolarize(threshold = 0.5, p=0.0)
         ])
         self.transform_prime = transforms.Compose([
-            transforms.RandomResizedCrop(self.l, (0.8,1.0)),
-            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomResizedCrop(self.l, (0.5,1.0)),
+            transforms.RandomHorizontalFlip(p=0.0),
             transforms.RandomApply(
                 [transforms.ColorJitter(brightness=0.4, contrast=0.4,
                                         saturation=0.2, hue=0.1)],
                 p=0.8
             ),
-            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomGrayscale(p=0.0),
             transforms.RandomApply([transforms.GaussianBlur(kernel_size=int(l//10) if int(l//10)%2!=0 else int(l//10)+1,
                                                             sigma=(0.8,2.0))],
-                                   p=0.1),
-            transforms.RandomSolarize(threshold = 0.5, p=0.2)
+                                   p=0.4),
+            transforms.RandomSolarize(threshold = 0.5, p=0.0)
         ])
     def __call__(self, x):
         x1 = self.transform(x)

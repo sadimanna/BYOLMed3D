@@ -96,7 +96,7 @@ class ClassificationModel(nn.Module):
         elif self.num_classes == 2 and self.classification_type == 'multi-label':
             num_classes = 2
         else:
-            num_classes = self.model.num_classes
+            num_classes = self.num_classes
         
         self.base_encoder = models.video.r3d_18(num_classes = num_classes)
         
@@ -110,11 +110,11 @@ class ClassificationModel(nn.Module):
         #     self.base_encoder.fc.in_features = prev_layer_out_features
         #     self.base_encoder.fc.out_features = prev_layer_out_features
         
-        self.bin_pos_wts = kwargs['bin_pos_wts'] if kwargs.__contains__('bin_pos_wts') else 1.0
+        self.bin_pos_wts = kwargs['bin_pos_wts'] if kwargs.__contains__('bin_pos_wts') else torch.Tensor([1.0]*num_classes)
         if self.classification_type == 'multi-class':
-            self.criterion = nn.CrossEntropyLoss()
+            self.criterion = nn.CrossEntropyLoss(weight = self.bin_pos_wts)
         elif self.classification_type in ['binary','multi-label']:
-            self.criterion = nn.BCEWithLogitsLoss(pos_weight = torch.Tensor([self.bin_pos_wts]))
+            self.criterion = nn.BCEWithLogitsLoss(pos_weight = self.bin_pos_wts)
 
         #if stage == 'lineval':
         #    for p in self.base_encoder
