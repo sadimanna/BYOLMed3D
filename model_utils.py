@@ -98,7 +98,8 @@ class ClassificationModel(nn.Module):
         else:
             num_classes = self.num_classes
         
-        self.base_encoder = models.video.r3d_18(num_classes = num_classes)
+        self.base_encoder = models.video.r3d_18(pretrained = False)
+        self.base_encoder.fc = nn.Linear(512, num_classes)
         
         if self.data_dims.split('x')[0] == '32':
             self.base_encoder.conv1 = nn.Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), bias=False)

@@ -87,8 +87,11 @@ def main(args):
                              args.pt_num_frames,
                              args.ds_num_frames,
                              args.acc_bs,
-                             2,
-                             None)
+                             1,
+                             None,
+                             224,
+                             dsoversample = True,
+                             dsbinary = True)
 
     trainer = Trainer(args.run_num,
                       DummyModel(args.model_name, args.base_encoder_name),
@@ -120,8 +123,7 @@ def main(args):
     ds_model = ClassificationModel(args.base_encoder_name,
                                    dm.num_classes, 
                                    args.data_dims,
-                                   classification_type = 'binary',
-                                   bin_pos_wts = 4.4327).to('cuda:0')
+                                   classification_type = 'binary').to('cuda:0')
     #KNN EVALUATION
     # knn_eval_metrics = trainer.knn_eval(ds_model, 
     #                                     fracs = args.knn_fracs, 
@@ -132,11 +134,11 @@ def main(args):
     #                                     net_model_path = args.model_path)
     # LINEAR EVALUATION
     #ds_model = ClassificationModel('resnet18',dm.num_classes).to('cuda:0')
-    #lin_eval_metrics = trainer.linear_eval(ds_model, net_model_path = args.model_path, mode = 'train')
+    # lin_eval_metrics = trainer.linear_eval(ds_model, net_model_path = args.model_path, mode = 'train')
     #FINE TUNING
     fine_tune_metrics = trainer.fine_tune(dsmodel = ds_model, net_model_path = args.model_path, mode = 'train')
 
-    metrics_dict = fine_tune_metrics #lin_eval_metrics #{**knn_eval_metrics, **lin_eval_metrics} #, **fine_tune_metrics}
+    metrics_dict = {**fine_tune_metrics} #, **lin_eval_metrics} #{**knn_eval_metrics, **lin_eval_metrics} #, **fine_tune_metrics}
     # print(metrics_dict)
     # print(dict_args)
     trainer.writer.add_hparams(dict_args, metrics_dict,

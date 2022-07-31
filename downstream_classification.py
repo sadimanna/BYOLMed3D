@@ -3,19 +3,28 @@ import argparse #ArgumentParser, BooleanOptionalAction
 from tabulate import tabulate
 from datetime import datetime
 
-import simclr, moco, simsiam, byol, barlow_twins, cumi, mdmi, mvie
-from dataloader_modules import CIFAR10ArrayDataModule, CIFAR100DataModule, STL10DataModule, TinyImageNetDataModule
+import torch
+import torch.nn as nn
+import torch.nn.functional as tF
+import torch.optim as optim
+from torchvision import datasets, transforms, models
+
+import byol3d #simclr, moco, simsiam, byol, barlow_twins, cumi, mdmi, mvie
+from dataloaders import MRNetDataModule
+from transformations import *
 from trainer import Trainer
+from utils import seed_everything
 from utils import run_command
 from model_utils import ClassificationModel
-from model_transforms import *
 
+seed_everything(1234)
 
 class DummyModel(nn.Module):
-    def __init__(self, model_name, base_encoder_name):
+    def __init__(self, model_name, base_encoder_name, pt_bs):
         super().__init__()
         self.model_name = model_name
         self.base_encoder_name = base_encoder_name
+        self.pretrain_batch_size = pt_bs
 
 def main(args):
 
@@ -30,6 +39,8 @@ def main(args):
         os.makedirs(args.dataset_path)
     if not os.path.exists(args.modelsavepath):
         os.makedirs(args.modelsavepath)    
+
+    transforms_ = BYOLTransform(int(args.data_dims.split('x')[0]))
 
     if args.dataset == 'mrnet':
         class_name = 'acl' #input("Enter class name : [acl / abn / men] : ")
@@ -48,8 +59,8 @@ def main(args):
 
 
     trainer = Trainer(args.run_num,
-                      DummyModel(args.model_name, args.base_encoder_name),
-                      dm,
+                      DummyModel(args.model_name, args.base_encoder_name, args.pretrain_batch_size    ),
+                      dm,   
                       max_epochs = None, #args.max_epochs,
                       train_epochs = None, #args.train_epochs,
                       lineval_epochs = args.lineval_epochs,
@@ -133,7 +144,7 @@ if __name__ == '__main__':
     # parser.add_argument('--warmup_start_lr',type=float,default=1e-4)
     # parser.add_argument('--eta_min',type=float,default=1e-4)
     parser.add_argument('--pretrain_batch_size',type=int,default=64)
-    parser.add_argument('--other_batch_size',type=int,default=32)
+    parser.add_argument('--ds_batch_size',type=int,default=32)
     parser.add_argument('--lineval_epochs',type=int,default=20)
     parser.add_argument('--lineval_optim',type=str,default='sgd')
     parser.add_argument('--lineval_lr',type=float,default=0.05)
@@ -169,12 +180,19 @@ if __name__ == '__main__':
     # parser.add_argument('--n_temperature', type=float, default = None)
     # parser.add_argument('--lambda_loss', type=float, default = 1.0)
 
+    parser.add_argument('--grad_acc', action = 'store_true')
+    parser.add_argument('--acc_bs', type = int, default = 1)
+
+    parser.add_argument('--pt_num_frames', type=int, default=16)
+    parser.add_argument('--ds_num_frames', type=int, default=16)
+
     # parser.add_argument('--step_size', type=int, default = 10)
     # parser.add_argument('--lr_gamma', type=float, default=0.1)
     # parser.add_argument('--lr_milestones', type=str, default=None)
     # parser.add_argument('--lr_factor', type=float, default=None)
     # parser.add_argument('--lr_total_iters', type=int, default=None)
     parser.add_argument('--run_num', type=str, default=None)
+    parser.add_argument('--remarks', type=str, default=None)
 
 
     args = parser.parse_args()

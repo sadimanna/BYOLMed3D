@@ -99,6 +99,7 @@ class Trainer(nn.Module):
         #saving the final model
         if self.resume == True and start_epoch == self.train_epochs:
             epoch = start_epoch
+            self.final_net_save_path = self.model_path
             
         self.datamodule.setup(stage = 'train',pretrain = True)
         self.datamodule.setup(stage = 'valid',pretrain = True)
@@ -236,7 +237,7 @@ class Trainer(nn.Module):
 
             if mode == 'train':
                 print(":::::::::::::Semi-Supervised Fine-Tuning for {frac:.5f}% of Training Data::::::::::::".format(frac=fracs*100), flush = True)
-                #LOAD FINAL MODEL
+                LOAD FINAL MODEL
                 if net_model_path is not None:
                     dsmodel.load_state_dict(torch.load(net_model_path), strict = False)
                 else:
@@ -388,6 +389,8 @@ class Trainer(nn.Module):
             optimizer = torch.optim.SGD(parameters, lr = lr, momentum = momentum)
         if optim == 'adam':
             optimizer = torch.optim.Adam(parameters, lr = lr)
+        if optim == 'rmsprop':
+            optimizer = torch.optim.RMSprop(parameters, lr = lr)
 
         # ======== ONLY FOR BINARY AND MULTILABEL CLASSIFICATION FOR IMBALNACED DATASETS
         self.evaluation_model.bin_pos_wts = self.datamodule.traingen.bin_pos_wts
@@ -410,7 +413,7 @@ class Trainer(nn.Module):
                                                                        verbose = True)
         elif scheduler == 'multistep':
             lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                                milestones = [int(0.6*ds_epochs), int(0.80*ds_epochs)],
+                                                                milestones = [int(0.6*ds_epochs), int(0.8*ds_epochs)],
                                                                 gamma = 0.1,
                                                                 verbose = True)
         self.train_losses, self.valid_losses = np.array([]), np.array([])
@@ -458,9 +461,9 @@ class Trainer(nn.Module):
                     torch.save(self.evaluation_model.state_dict(), self.dsfilepath)
             else:
                 counter+=1
-                if counter>patience:
-                    print("Stopping Early. No more patience left.")
-                    break
+                # if counter>patience:
+                #     print("Stopping Early. No more patience left.")
+                #     break
 
         #fig = plot_metrics(self.train_losses, self.valid_losses, 'Loss')
         #fig = plot_metrics(self.train_accuracy, self.valid_accuracy, 'Accuracy')
