@@ -306,8 +306,7 @@ class SSLDCMDFDataset(Dataset):
 
             original = frame.unsqueeze(1).repeat(1,3,1,1)
             #print(original.shape)
-
-            original = original / 255.0
+            #original = original / 255.0
 
             x1, x2 = self.augment(original)
 
@@ -318,12 +317,12 @@ class SSLDCMDFDataset(Dataset):
             original1 = frame1.unsqueeze(1).repeat(1,3,1,1)
             #torch.from_numpy(np.repeat(frame1[:,None,:,:],3,axis=1).astype(np.float32))
             #print(original.shape)
-            original1 = original1 / 255.0
+            #original1 = original1 / 255.0
 
             original2 = frame2.unsqueeze(1).repeat(1,3,1,1)
             #torch.from_numpy(np.repeat(frame2[:,None,:,:],3,axis=1).astype(np.float32))
             #print(original.shape)
-            original2 = original2 / 255.0
+            #original2 = original2 / 255.0
 
             x1, _ = self.augment(original1)
             x2, _ = self.augment(original2)
@@ -452,8 +451,7 @@ class SLDCMDFDataset(Dataset):
         original = frame.unsqueeze(1).repeat(1,3,1,1)
         # torch.from_numpy(np.repeat(frame[:,None,:,:],3,axis=1).astype(np.float32))
         #print(original.shape)
-
-        original = original / 255.0
+        #original = original / 255.0
 
         x1 = self.augment(original)
         # plt.imshow(x1[0].numpy().transpose(1,2,0))
