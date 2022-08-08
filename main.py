@@ -163,6 +163,20 @@ if __name__ == '__main__':
                              224,
                              dsoversample = True,
                              dsbinary = True)
+    elif args.dataset == 'rsnabrats':
+        class_name = 'MGMT_value'
+        plane = 'T1w'
+        dm = RSNABraTSModule(args.dataset_path,
+                             class_name,
+                             plane,
+                             args.pt_num_frames,
+                             args.ds_num_frames,
+                             args.acc_bs,
+                             args.ds_batch_size,
+                             transforms_,
+                             224,
+                             dsoversample = True,
+                             dsbinary = True)
 
     # =============================================================================
 
