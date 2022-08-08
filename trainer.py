@@ -1,795 +1,767 @@
-import os
 import numpy as np
+import pandas as pd
+import shutil, os, requests, random, copy, sys
+import collections, datetime
+# import imageio
+# from sklearn.transform import rotate, AffineTransform, warp, resize
+# import skvideo.io as vidio
 import torch
 import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
-from model_utils import ClassificationModel
-from typing import Type, Any
-from datetime import datetime
-from utils import save_model, plot_features
-from perf_metrics import get_performance_metrics
+from torchvision import transforms
 
-from sklearn.neighbors import KNeighborsClassifier
+from torch.utils.data import Dataset, DataLoader
+from typing import Any, Optional
 
-class Trainer(nn.Module):
-    def __init__(self,
-                 run_num: str,
-                 model: nn.Module,
-                 datamodule: nn.Module,
-                 grad_acc : bool = False,
-                 acc_bs: int = 2,
-                 train_epochs: int = 100,
-                 lineval_epochs: int = 100,
-                 lineval_optim: str = 'sgd',
-                 lineval_lr: float = 0.01,
-                 lineval_momentum: float = 0.9,
-                 lineval_wd: float = 0.0,
-                 lineval_lr_schedule: str = 'steplr',
-                 finetune_epochs: int = 100,
-                 finetune_optim: str = 'sgd',
-                 finetune_lr: float = 0.01,
-                 finetune_momentum: float = 0.9,
-                 finetune_wd: float = 0.0,
-                 finetune_lr_schedule: str = 'steplr',
-                 max_epochs: int = 1000,
-                 modelsavepath: str = os.getcwd(),
-                 modelsaveinterval: int = 1,
-                 resume: bool = False,
-                 model_path: str = None,
-                 show_valid_metrics: bool = True,
-                 lowest_val_eval: bool = False,
-                 **kwargs: Any) -> None:
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+
+from dicom_utils import load_dcmvolume
+
+class SSLDataFrameDataset(Dataset):
+	def __init__(self, phase, df, target_class, num_frames, transformations = None):
+		super().__init__()
+		self.phase = phase
+		self.filenames_df = df
+		self.target_class = target_class
+		self.transforms = transformations
+		self.num_frames = num_frames
+		self.x1minframeidx = 0
+		# self.mean = 0
+		# self.std = 0
+	# ===================================
+
+	def load_volume(self, file_idx):
+		filePoolLen = self.filenames_df.shape[0]
+		file_idx = file_idx%filePoolLen #np.random.randint(0,filePoolLen)
+		npy_file = np.load(self.filenames_df['filename'].iloc[file_idx])
+		return npy_file
+	
+	# ===================================
+
+	def get_frames(self, idx, repeat = False):
+		image_volume = self.load_volume(idx)
+		tot_frames = image_volume.shape[0]
+		if not repeat:
+			self.x1minframeidx = min(self.x1minframeidx, tot_frames - 16)
+			frame_idxs = np.arange(self.x1minframeidx, self.x1minframeidx+16)
+		else:
+			frame_idxs = np.random.randint(max(0,self.x1minframeidx-tot_frames//10),tot_frames,size=self.num_frames)
+		frames = np.array(image_volume[frame_idxs,:,:])
+		self.x1minframeidx = np.min(frame_idxs)
+		#print(frames.shape)
+		return frames
+
+	# ===================================
+	
+	def __len__(self):
+		#return int(np.floor((len(self.filenames_df)/self.batch_size)))
+		return len(self.filenames_df)
+
+	# ====================================
+	
+	def __getitem__(self, idx):
+
+		#GET CLIP FRAMES
+		file_idx = idx #self.start_idx + bs
+		
+		if np.random.random() < 0.75:
+			frame = self.get_frames(idx, False)
+			
+			original = torch.from_numpy(np.repeat(frame[:,None,:,:],3,axis=1).astype(np.float32))
+			#print(original.shape)
+
+			original = original / 255.0
+
+			x1, x2 = self.augment(original)
+		
+		else:
+			frame1 = self.get_frames(idx, False)
+			frame2 = self.get_frames(idx, True if np.random.random() < 0.5 else False)
+
+			original1 = torch.from_numpy(np.repeat(frame1[:,None,:,:],3,axis=1).astype(np.float32))
+			#print(original.shape)
+			original1 = original1 / 255.0
+
+			original2 = torch.from_numpy(np.repeat(frame2[:,None,:,:],3,axis=1).astype(np.float32))
+			#print(original.shape)
+			original2 = original2 / 255.0
+
+			x1, _ = self.augment(original1)
+			x2, _ = self.augment(original2)
+
+			# print(x1.mean(dim = (0,2,3), keepdim = True), x1.std(dim = (0,2,3), keepdim = True))
+
+		x1 = (x1 - x1.mean(dim = (0,2,3), keepdim = True))/x1.std(dim = (0,2,3), keepdim = True)
+		x2 = (x2 - x2.mean(dim = (0,2,3), keepdim = True))/x2.std(dim = (0,2,3), keepdim = True)
+
+		x1 = x1.transpose(0,1).contiguous()
+		x2 = x2.transpose(0,1).contiguous()
+
+		y = self.filenames_df[self.target_class].values[idx]
+
+		return x1.to(dtype = torch.float), x2.to(dtype = torch.float), y
+
+	# ===================================     
+	
+	def on_epoch_end(self):
+		self.filenames_df = self.filenames_df.sample(frac=1).reset_index(drop=True)
+
+	# ==================================
+ 
+	#applies randomly selected augmentations to each clip (same for each frame in the clip)
+	def augment(self, x):
+		if self.phase == 'train':
+			x1, x2 = self.transforms(x)
+		else:
+			x1, x2 = self.transforms(x), self.transforms(x)
+		return x1, x2
+
+# ================================================================================
+
+class SLDataFrameDataset(Dataset):
+	def __init__(self, 
+				 phase, 
+				 df, 
+				 class_name, 
+				 num_frames, 
+				 transformations = None, 
+				 fracs = 1.0,
+				 dsoversample = True,
+				 dsbinary = True):
+		super().__init__()
+		self.phase = phase
+		if self.phase != 'test':
+			self.mult = 1
+		else:
+			self.mult = 5
+		self.df = df
+		self.fracs = fracs
+		self.class_name = class_name
+		self.num_frames = num_frames
+		self.dsoversample = dsoversample
+		self.dsbinary = dsbinary
+		if self.fracs < 1.0:
+			self.df, _ = train_test_split(self.df, test_size = 1 - fracs)
+		# self.normalize = transforms.Normalize(mean, std)
+		self.transforms = transformations
+
+		self.global_idx = 0
+
+		if self.phase == 'train':
+			if self.dsbinary and self.dsoversample:
+				num_1 = np.count_nonzero(self.df[self.class_name].values==1)
+				num_0 = np.count_nonzero(self.df[self.class_name].values==0)
+				if num_1 > num_0:
+					print(f"Oversampling Negative Samples of {self.class_name}...")
+					gap = num_1 - num_0
+					df_zero = self.df[self.df[self.class_name].values == 0]
+					self.df = self.df.append(df_zero.sample(n = gap, replace = True, random_state = 0), ignore_index = True)
+				elif num_0 > num_1:
+					print(f"Oversampling Positive Samples of {self.class_name}...")
+					gap = num_0 - num_1
+					df_one = self.df[self.df[self.class_name].values == 1]
+					self.df = self.df.append(df_one.sample(n = gap, replace = True, random_state = 1), ignore_index = True)
+				else:
+					print(f"Class {self.class_name} is balanced")
+				self.bin_pos_wts = torch.Tensor([1.0])
+			if self.dsbinary and not self.dsoversample:
+				num_1 = np.count_nonzero(self.df[self.class_name].values==1)
+				num_0 = np.count_nonzero(self.df[self.class_name].values==0)
+				self.bin_pos_wts = torch.Tensor([num_1/num_0])
+			if not self.dsbinary and not self.oversample:
+				self.bin_pos_wts = np.array([])
+				for c in self.class_name:
+					num_1 = np.count_nonzero(self.df[c].values==1)
+					num_0 = np.count_nonzero(self.df[c].values==0)
+					self.bin_pos_wts = np.append(self.bin_pos_wts, num_1/num_0)
+				self.bin_pos_wts = torch.from_numpy(self.bin_pos_wts)
+
+	# ===================================
+	def load_volume(self, file_idx):
+		filePoolLen = self.df.shape[0]
+		file_idx = file_idx%filePoolLen #np.random.randint(0,filePoolLen)
+		npy_file = np.load(self.df['filename'].iloc[file_idx])
+		return npy_file
+	
+	# ===================================
+
+	def get_frames(self, idx):
+		image_volume = self.load_volume(idx)
+		tot_frames = image_volume.shape[0]
+		# frame_idxs = np.random.randint(0,tot_frames,size=self.num_frames)
+		frame_idxs = np.array(sorted(random.sample(list(range(tot_frames)),min(tot_frames,16))))
+		frames = np.array(image_volume[frame_idxs,:,:])
+		#print(frames.shape)
+		return frames
+
+	# ===================================
+	
+	def __getitem__(self, idx):
+
+		#GET CLIP FRAMES
+		if self.global_idx == self.__len__():
+			self.global_idx = 0
+			
+		file_idx = self.global_idx//self.mult #self.start_idx + bs
+
+		
+		frame = self.get_frames(file_idx)
+		
+		original = torch.from_numpy(np.repeat(frame[:,None,:,:],3,axis=1).astype(np.float32))
+		#print(original.shape)
+
+		original = original / 255.0
+
+		x1 = self.augment(original)
+		# plt.imshow(x1[0].numpy().transpose(1,2,0))
+		# plt.show()
+		m = x1.mean(dim = (0,2,3), keepdim = True)
+		s = x1.std(dim = (0,2,3), keepdim = True)
+
+		x1 = (x1 - m)/s
+		# x2 = (x2 - x2.mean(dim = 0))/x2.std(dim = 0)
+		x1 = x1.transpose(0,1).contiguous()
+
+		y = self.df[self.class_name].values[self.global_idx//self.mult]
+
+		self.global_idx += 1
+
+		return x1.to(dtype = torch.float), y
+	# ===================================
+		
+	def __len__(self):
+		return len(self.df)*self.mult
+
+	# ===================================
+	# ===================================
+
+	#shuffles the dataset at the end of each epoch
+	def on_epoch_end(self):
+		self.global_idx = 0
+		self.df = self.df.sample(frac=1).reset_index(drop=True)
+
+	# ===================================
+
+	#applies randomly selected augmentations to each clip (same for each frame in the clip)
+	def augment(self, x):
+		if self.transforms is not None:
+			x = self.transforms(x)
+		# x = self.normalize(x)
+		return x
+
+# ================================================================================
+
+class SSLDCMDFDataset(Dataset):
+    def __init__(self, phase, df, target_class, num_frames, transformations = None):
         super().__init__()
+        self.phase = phase
+        self.filenames_df = df
+        self.target_class = target_class
+        self.transforms = transformations
+        self.num_frames = num_frames
+        self.x1minframeidx = 0
+        # self.mean = 0
+        # self.std = 0
+        # ===================================
+        self.load_volume = load_dcmvolume
 
-        self.model = model
-        self.datamodule = datamodule
-        self.train_epochs = train_epochs
-        self.lineval_epochs = lineval_epochs
-        self.lineval_optim = lineval_optim
-        self.lineval_lr = lineval_lr
-        self.lineval_momentum = lineval_momentum
-        self.lineval_wd = lineval_wd
-        self.lineval_lr_schedule = lineval_lr_schedule
-        self.finetune_epochs = finetune_epochs
-        self.finetune_optim = finetune_optim
-        self.finetune_lr = finetune_lr
-        self.finetune_momentum = finetune_momentum
-        self.finetune_wd = finetune_wd
-        self.finetune_lr_schedule = finetune_lr_schedule
-        self.max_epochs = max_epochs
-        self.modelsavepath = modelsavepath
-        self.modelsaveinterval = modelsaveinterval
-        self.resume = resume
-        self.model_path = model_path
-        self.model_name = self.model.model_name
-        self.show_valid_metrics = show_valid_metrics
-        self.lowest_val_eval = lowest_val_eval
+    # def load_volume(self, file_idx):
+    #    filePoolLen = self.filenames_df.shape[0]
+    #    file_idx = file_idx%filePoolLen #np.random.randint(0,filePoolLen)
+    #    npy_file = np.load(self.filenames_df['filename'].iloc[file_idx])
+    #    return npy_file
 
-        self.grad_acc = grad_acc
-        self.batch_size = self.model.pretrain_batch_size
-        self.acc_bs = acc_bs
-        self.acc_iter = self.batch_size // self.acc_bs if self.grad_acc else 1
-        
-        self.ds_num_classes = None
+        # ===================================
 
-        self.ft_fc_lr = kwargs['ft_fc_lr'] if kwargs['ft_fc_lr'] is not None else self.finetune_lr
-        
-        self.datestr = datetime.today().strftime("%d-%m-%y-%H-%M-%S")
-
-        self.run_num = '_'.join([datetime.today().strftime("%d-%m-%y"), run_num])
-
-        # self.datamodule.prepare_data()
-
-        self.writer = SummaryWriter('/'.join(['runs','_'.join([self.model_name,
-                                                               self.model.base_encoder_name,
-                                                               self.run_num])]))
-
-    def fit(self):
-        if self.resume:
-            state_dict = torch.load(self.model_path)
-            self.model.load_state_dict(state_dict['model_state_dict'])
-            self.model.optimizer.load_state_dict(state_dict['optimizer_state_dict'])
-            self.model.scheduler.load_state_dict(state_dict['scheduler_state_dict'])
-            start_epoch = self.model.scheduler.last_epoch
-            print("Resuming Training...Starting Epoch: ",start_epoch)
+    def get_frames(self, idx, repeat = False):
+    	filepath = self.filenames_df['filepath'].iloc[idx]
+        image_volume = self.load_dcmvolume(filepath)
+        tot_frames = image_volume.shape[0]
+        if not repeat:
+            self.x1minframeidx = min(self.x1minframeidx, tot_frames - 16)
+            frame_idxs = np.arange(self.x1minframeidx, self.x1minframeidx+16)
         else:
-            start_epoch = 0
+            frame_idxs = np.random.randint(max(0,self.x1minframeidx-tot_frames//10),tot_frames,size=self.num_frames)
+        frames = image_volume[frame_idxs,:,:]
+        self.x1minframeidx = np.min(frame_idxs)
+        #print(frames.shape)
+        return frames
 
-        #saving the final model
-        if self.resume == True and start_epoch == self.train_epochs:
-            epoch = start_epoch
-            self.final_net_save_path = self.model_path
-            
-        self.datamodule.setup(stage = 'train',pretrain = True)
-        self.datamodule.setup(stage = 'valid',pretrain = True)
-        self.train_loader = self.datamodule.train_dataloader(True)
-        self.valid_loader = self.datamodule.valid_dataloader(True)
-        if hasattr(self.model, 'max_training_steps'):
-            self.model.max_training_steps = self.max_epochs*(len(self.train_loader))
-        #self.optimizer, self.scheduler = self.model.configure_optimizers()
-        self.train_losses, self.valid_losses = np.array([]), np.array([])
-        self.min_val_loss = None
+        # ===================================
 
-        for epoch in range(start_epoch, self.train_epochs):
-            print("\nEpoch {}".format(epoch+1), flush = True)
-            train_epoch_loss = self.train_epoch(self.model, self.train_loader, self.model.optimizer, epoch, self.writer)
-            self.train_losses = np.append(self.train_losses, train_epoch_loss)
-            self.writer.add_scalar('Pretrain/Loss/train',train_epoch_loss, epoch)
-            self.model.scheduler.step()
-            features, labels, val_epoch_loss = self.valid_epoch(self.model, self.valid_loader, epoch, self.writer)
-            self.writer.add_scalar('Pretrain/Loss/valid',val_epoch_loss, epoch)
-            if self.min_val_loss is None or val_epoch_loss < self.min_val_loss:
-                self.min_val_loss = val_epoch_loss
-                self.lowest_val_model_path = save_model(self.model,
-                                                       epoch+1,
-                                                       self.modelsavepath,
-                                                       '_'.join([self.model.model_name,self.run_num,'lowest_val.pt']))
-            self.valid_losses = np.append(self.valid_losses, val_epoch_loss)
-            #fig = plot_metrics(self.train_losses, self.valid_losses, 'Loss')
-            #self.writer.add_figure('Pretrain/metrics',fig,epoch)
-            if (epoch+1) % self.modelsaveinterval == 0:
-                self.final_model_save_path = save_model(self.model,
-                                                       epoch+1,
-                                                       self.modelsavepath,
-                                                       '_'.join([self.model.model_name,
-                                                                self.run_num, '{}.pt']))
-                print(f"Model at epoch {epoch+1} saved at {self.final_model_save_path}")
-                fig = plot_features(features, labels, 2 if self.datamodule.num_classes==1 else self.datamodule.num_classes, epoch)
-                self.writer.add_figure('Pretrain/TSNE-Features',fig,epoch)
+    def __len__(self):
+        #return int(np.floor((len(self.filenames_df)/self.batch_size)))
+        return len(self.filenames_df)
 
-        #saving the final model
-        if start_epoch < self.train_epochs:
-            #epoch = start_epoch
-            self.final_model_save_path = save_model(self.model, 
-                                                    epoch+1, 
-                                                    self.modelsavepath, 
-                                                    '_'.join([self.model.model_name,self.run_num,'final.pt']))
-            print(f"Final Model at epoch {epoch+1} saved at {self.final_model_save_path}")
+        # ====================================
 
-            #SAVING ONLY THE ENCODER
-            self.final_net_save_path = '/'.join([self.modelsavepath,
-                                                '_'.join([self.model.model_name,
-                                                          self.run_num,
-                                                          'final_net.pt'])])
-            torch.save(self.model.net.state_dict(), self.final_net_save_path)
-            print(f"Encoder of Final Model at epoch {epoch+1} saved at {self.final_net_save_path}")
+    def __getitem__(self, idx):
 
-    def load_model_for_eval(self):
-        state_dict = torch.load(self.model_path)
-        self.model.load_state_dict(state_dict['model_state_dict'])
-        self.model.optimizer.load_state_dict(state_dict['optimizer_state_dict'])
-        self.model.scheduler.load_state_dict(state_dict['scheduler_state_dict'])
-        start_epoch = self.model.scheduler.last_epoch
-        print("Epoch State: ",start_epoch)
+        #GET CLIP FRAMES
+        file_idx = idx #self.start_idx + bs
+
+        if np.random.random() < 0.75:
+            frame = self.get_frames(idx, False)
+
+            original = frame.unsqueeze(1).repeat(1,3,1,1)
+            #print(original.shape)
+
+            original = original / 255.0
+
+            x1, x2 = self.augment(original)
+
+        else:
+            frame1 = self.get_frames(idx, False)
+            frame2 = self.get_frames(idx, True if np.random.random() < 0.5 else False)
+
+            original1 = frame1.unsqueeze(1).repeat(1,3,1,1)
+            #torch.from_numpy(np.repeat(frame1[:,None,:,:],3,axis=1).astype(np.float32))
+            #print(original.shape)
+            original1 = original1 / 255.0
+
+            original2 = frame2.unsqueeze(1).repeat(1,3,1,1)
+            #torch.from_numpy(np.repeat(frame2[:,None,:,:],3,axis=1).astype(np.float32))
+            #print(original.shape)
+            original2 = original2 / 255.0
+
+            x1, _ = self.augment(original1)
+            x2, _ = self.augment(original2)
+
+            # print(x1.mean(dim = (0,2,3), keepdim = True), x1.std(dim = (0,2,3), keepdim = True))
+
+        x1 = (x1 - x1.mean(dim = (0,2,3), keepdim = True))/x1.std(dim = (0,2,3), keepdim = True)
+        x2 = (x2 - x2.mean(dim = (0,2,3), keepdim = True))/x2.std(dim = (0,2,3), keepdim = True)
+
+        x1 = x1.transpose(0,1).contiguous()
+        x2 = x2.transpose(0,1).contiguous()
+
+        y = self.filenames_df[self.target_class].values[idx]
+
+        return x1.to(dtype = torch.float), x2.to(dtype = torch.float), y
+
+        # ===================================     
+
+    def on_epoch_end(self):
+        self.filenames_df = self.filenames_df.sample(frac=1).reset_index(drop=True)
+
+        # ==================================
+
+    #applies randomly selected augmentations to each clip (same for each frame in the clip)
+    def augment(self, x):
+        if self.phase == 'train':
+            x1, x2 = self.transforms(x)
+        else:
+            x1, x2 = self.transforms(x), self.transforms(x)
+        return x1, x2
+
+        # ================================================================================
+
+class SLDCMDFDataset(Dataset):
+    def __init__(self, 
+         phase, 
+         df, 
+         class_name, 
+         num_frames, 
+         transformations = None, 
+         fracs = 1.0,
+         dsoversample = True,
+         dsbinary = True):
+        super().__init__()
+        self.phase = phase
+        if self.phase != 'test':
+            self.mult = 1
+        else:
+            self.mult = 5
+        self.df = df
+        self.fracs = fracs
+        self.class_name = class_name
+        self.num_frames = num_frames
+        self.dsoversample = dsoversample
+        self.dsbinary = dsbinary
+        if self.fracs < 1.0:
+            self.df, _ = train_test_split(self.df, test_size = 1 - fracs)
+        # self.normalize = transforms.Normalize(mean, std)
+        self.transforms = transformations
         
-        self.datamodule.setup(stage = 'valid',pretrain = True)
-        
-        self.valid_loader = self.datamodule.valid_dataloader(True)
-        if hasattr(self.model, 'max_training_steps'):
-            self.model.max_training_steps = self.max_epochs*(len(self.train_loader))
-        
-        self.train_losses, self.valid_losses = np.array([]), np.array([])
-        self.min_val_loss = None
+        self.load_volume = load_dcmvolume
 
-        for epoch in range(1):
-            print("\nExtracting Features...", flush = True)
-            
-            features, labels, val_epoch_loss = self.valid_epoch(self.model, self.valid_loader)
-            self.writer.add_scalar('Inference/Loss/valid',val_epoch_loss, epoch)
-            
-            fig = plot_features(features, labels, self.datamodule.num_classes, epoch)
-            self.writer.add_figure('Inference/TSNE-Features',fig,epoch)
+        self.global_idx = 0
 
-    def linear_eval(self,
-                    dsmodel,
-                    patience: int = 5,
-                    net_model_path: str = None,
-                    mode: str = 'train'
-                   ) -> Any:
-
-        '''
-            other_metrics: Dictionary {'metric1_name' : metric1_function,
-                                        'metric2_name' : metric2_function}
-
-        '''
-        print("::::::::::::::::::LINEAR EVALUATION INFERENCE::::::::::::::::::")
-        if mode == 'train':
-            if net_model_path is not None:
-                dsmodel.load_state_dict(torch.load(net_model_path), strict = False)
-            else:
-                if self.lowest_val_eval:
-                    dsmodel.load_state_dict(torch.load(self.lowest_val_model_path), strict = False)
+        if self.phase == 'train':
+            if self.dsbinary and self.dsoversample:
+                num_1 = np.count_nonzero(self.df[self.class_name].values==1)
+                num_0 = np.count_nonzero(self.df[self.class_name].values==0)
+                if num_1 > num_0:
+                    print(f"Oversampling Negative Samples of {self.class_name}...")
+                    gap = num_1 - num_0
+                    df_zero = self.df[self.df[self.class_name].values == 0]
+                    self.df = self.df.append(df_zero.sample(n = gap, replace = True, random_state = 0), ignore_index = True)
+                elif num_0 > num_1:
+                    print(f"Oversampling Positive Samples of {self.class_name}...")
+                    gap = num_0 - num_1
+                    df_one = self.df[self.df[self.class_name].values == 1]
+                    self.df = self.df.append(df_one.sample(n = gap, replace = True, random_state = 1), ignore_index = True)
                 else:
-                    dsmodel.load_state_dict(torch.load(self.final_net_save_path), strict = False)
+                    print(f"Class {self.class_name} is balanced")
+                self.bin_pos_wts = torch.Tensor([1.0])
+            if self.dsbinary and not self.dsoversample:
+                num_1 = np.count_nonzero(self.df[self.class_name].values==1)
+                num_0 = np.count_nonzero(self.df[self.class_name].values==0)
+                self.bin_pos_wts = torch.Tensor([num_1/num_0])
+            if not self.dsbinary and not self.oversample:
+                self.bin_pos_wts = np.array([])
+                for c in self.class_name:
+                    num_1 = np.count_nonzero(self.df[c].values==1)
+                    num_0 = np.count_nonzero(self.df[c].values==0)
+                    self.bin_pos_wts = np.append(self.bin_pos_wts, num_1/num_0)
+                self.bin_pos_wts = torch.from_numpy(self.bin_pos_wts)
 
-            metrics = self.train_classifier('linear_eval',
-                                            mode,
-                                            dsmodel,
-                                            True, 1.0,
-                                            self.lineval_epochs,
-                                            patience,
-                                            self.lineval_optim,
-                                            self.lineval_lr_schedule
-                                            )
-        else:
-            if net_model_path is not None:
-                # For evaluation the saved model will not have separate model_state_dict
-                dsmodel.load_state_dict(torch.load(net_model_path), strict = False)
-            else:
-                dsmodel.load_state_dict(torch.load(self.model_path), strict = False)
+    # ===================================
+    '''def load_volume(self, file_idx):
+        filePoolLen = self.df.shape[0]
+        file_idx = file_idx%filePoolLen #np.random.randint(0,filePoolLen)
+        npy_file = np.load(self.df['filename'].iloc[file_idx])
+        return npy_file'''
 
-            metrics = self.infer_classifier('linear_eval',
-                                            mode,
-                                            dsmodel,
-                                            True, 1.0
-                                            )
-        return metrics
+    # ===================================
 
-    def fine_tune(self,
-                  dsmodel,
-                  patience: int = 5,
-                  net_model_path: str = None,
-                  mode: str = 'train'
-                 ) -> Any:
-        metrics_dict = {}
-        for fracs in [1.0]:
+    def get_frames(self, idx):
+    	filepath = self.filenames_df['filepath'].iloc[idx]
+        image_volume = self.load_dcmvolume(filepath)
+        tot_frames = image_volume.shape[0]
+        # frame_idxs = np.random.randint(0,tot_frames,size=self.num_frames)
+        frame_idxs = np.array(sorted(random.sample(list(range(tot_frames)),min(tot_frames,16))))
+        frames = np.array(image_volume[frame_idxs,:,:])
+        #print(frames.shape)
+        return frames
 
-            if mode == 'train':
-                print(":::::::::::::Semi-Supervised Fine-Tuning for {frac:.5f}% of Training Data::::::::::::".format(frac=fracs*100), flush = True)
-                LOAD FINAL MODEL
-                if net_model_path is not None:
-                    dsmodel.load_state_dict(torch.load(net_model_path), strict = False)
-                else:
-                    if self.lowest_val_eval:
-                        dsmodel.load_state_dict(torch.load(self.lowest_val_model_path), strict = False)
-                    else:
-                        dsmodel.load_state_dict(torch.load(self.final_net_save_path), strict = False)
+    # ===================================
 
-                metrics = self.train_classifier('fine_tune',
-                                                'train',
-                                              dsmodel,
-                                              False, fracs,
-                                              self.finetune_epochs,
-                                              patience,
-                                              self.finetune_optim,
-                                              self.finetune_lr_schedule
-                                             )
-                metrics_dict = {**metrics_dict, **metrics}
-            else:
-                print("::::::Inference on Semi-Supervised Fine-Tuned Model for {frac:.5f}% of Training Data:::::".format(frac=fracs*100), flush = True)
-                #LOAD FINAL MODEL
-                if net_model_path is not None:
-                    dsmodel.load_state_dict(torch.load(net_model_path), strict = False)
-                else:
-                    dsmodel.load_state_dict(torch.load(self.model_path), strict = False)
+    def __getitem__(self, idx):
 
-                metrics = self.infer_classifier('fine_tune',
-                                                mode,
-                                                dsmodel,
-                                                False, fracs
-                                               )
-                metrics_dict = {**metrics_dict, **metrics}
+        #GET CLIP FRAMES
+        if self.global_idx == self.__len__():
+            self.global_idx = 0
 
-        return metrics_dict
+        file_idx = self.global_idx//self.mult #self.start_idx + bs
+        filepath = self.filenames_df['filepath'].iloc[file_idx]
 
-    def train_epoch(self,
-                    model: nn.Module,
-                    dataloader: nn.Module,
-                    optimizer: nn.Module,
-                    epoch: int,
-                    summary_writer: Any) -> int:
-        model.train()
-        train_losses = 0
-        with tqdm(dataloader, unit = 'batch', total = len(dataloader)) as tepoch:
-            optimizer.zero_grad(set_to_none = True)
-            for step, batch in enumerate(tepoch):
-                train_loss = model.step('train', batch, epoch*len(dataloader)+step, True if (step==0 or step%self.acc_iter==0) else False, summary_writer)/self.acc_iter
-                #self.writer.add_scalar('pretrain/train_loss_step',train_loss)
-                train_loss.backward()
-                train_losses += train_loss.item()
-                #print(train_losses)
-                tepoch.set_postfix(loss = self.acc_iter*train_loss.item())
-                if ((step+1)%self.acc_iter==0 or (step+1)==len(dataloader)):
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none = True)
-        train_losses = train_losses/(step+1)
-        return train_losses
+        frame = self.get_frames(filepath)
 
-    def valid_epoch(self,
-                    model: nn.Module,
-                    dataloader: nn.Module,
-                    epoch: int,
-                    summary_writer: Any) -> int:
-        model.eval()
-        valid_losses = 0
-        features = np.array([]).reshape((0,self.model.net.projector.in_features)) #_out_dim if not hasattr(self.model,'predictor_out_dim') or self.model.predictor_out_dim is None else self.model.predictor_out_dim))
-        labels = np.array([])
-        with torch.no_grad():
-            with tqdm(dataloader, unit = 'batch', total = len(dataloader)) as vepoch:
-                for step, batch in enumerate(vepoch):
-                    feats, label, valid_loss = model.step('valid',batch, epoch*len(dataloader)+step, summary_writer)
-                    features = np.append(features, feats, axis = 0)
-                    labels = np.append(labels, label)
-                    #self.writer.add_scalar('pretrain/train_loss_step',train_loss)
-                    valid_losses += valid_loss.item()
-                    vepoch.set_postfix(loss = valid_loss.item())
-            valid_losses = valid_losses/(step+1)
-        return features, labels, valid_losses
+        original = frame.unsqueeze(1).repeat(1,3,1,1)
+        # torch.from_numpy(np.repeat(frame[:,None,:,:],3,axis=1).astype(np.float32))
+        #print(original.shape)
 
-    def train_classifier(self,
-                       stage: str,
-                       mode: str,
-                       model: nn.Module,
-                       linear_eval: bool,
-                       fracs: float = 1.0,
-                       ds_epochs: int = 100,
-                       patience: int = 5,
-                       optim: str = 'sgd',
-                       scheduler: str = 'steplr'
-                      ) -> None:
+        original = original / 255.0
 
-        stage = stage
-        mode = mode
-        model = model
-        linear_eval = linear_eval
-        #for p in model.parameters():
-        #    p.requires_grad = False
-        #if not linear_eval:
-        #    for p in model.net.base_encoder.parameters():
-        #        p.requires_grad = True
+        x1 = self.augment(original)
+        # plt.imshow(x1[0].numpy().transpose(1,2,0))
+        # plt.show()
+        m = x1.mean(dim = (0,2,3), keepdim = True)
+        s = x1.std(dim = (0,2,3), keepdim = True)
 
-        fracs = fracs
-        ds_epochs = ds_epochs
-        patience = patience
-        counter = 0
+        x1 = (x1 - m)/s
+        # x2 = (x2 - x2.mean(dim = 0))/x2.std(dim = 0)
+        x1 = x1.transpose(0,1).contiguous()
 
-        optim = optim
-        scheduler = scheduler
+        y = self.df[self.class_name].values[self.global_idx//self.mult]
 
-        lr = self.lineval_lr if linear_eval else self.finetune_lr
-        momentum = self.lineval_momentum if linear_eval else self.finetune_momentum
+        self.global_idx += 1
 
-        if linear_eval:
-            for n,p in model.named_parameters():
-                if 'fc' not in n:
-                    p.requires_grad = False
-                else:
-                    p.requires_grad = True
-        else:
-            for p in model.parameters():
-                p.requires_grad = True
+        return x1.to(dtype = torch.float), y
+    # ===================================
 
-        self.evaluation_model = model #
-        self.datamodule.setup(stage = 'train',pretrain = False, fracs = fracs)
-        self.datamodule.setup(stage = 'valid',pretrain = False)
-        self.train_loader = self.datamodule.train_dataloader(False)
-        self.valid_loader = self.datamodule.valid_dataloader(False)
-        self.datamodule.setup(stage = 'test',pretrain = False)
-        self.test_loader = self.datamodule.test_dataloader(False)
+    def __len__(self):
+        return len(self.df)*self.mult
 
-        # setting different learning rates for differetn parts of the model
-        if not linear_eval:
-            params_encoder = []
-            params_fc = []
-            encoder_lr = self.finetune_lr
-            fc_lr = self.ft_fc_lr
-            for n,p in self.evaluation_model.named_parameters():
-                if 'fc' not in n:
-                    params_encoder.append(p)
-                else:
-                    params_fc.append(p)
-            enc_params = {'params':params_encoder,'lr':encoder_lr}
-            fc_params = {'params':params_fc, 'lr':fc_lr}
-            parameters = [enc_params, fc_params]
-        else:
-            parameters = [p for p in self.evaluation_model.parameters() if p.requires_grad]
+    # ===================================
+    # ===================================
 
-        if optim == 'sgd':
-            optimizer = torch.optim.SGD(parameters, lr = lr, momentum = momentum)
-        if optim == 'adam':
-            optimizer = torch.optim.Adam(parameters, lr = lr)
-        if optim == 'rmsprop':
-            optimizer = torch.optim.RMSprop(parameters, lr = lr)
+    #shuffles the dataset at the end of each epoch
+    def on_epoch_end(self):
+        self.global_idx = 0
+        self.df = self.df.sample(frac=1).reset_index(drop=True)
 
-        # ======== ONLY FOR BINARY AND MULTILABEL CLASSIFICATION FOR IMBALNACED DATASETS
-        self.evaluation_model.bin_pos_wts = self.datamodule.traingen.bin_pos_wts
-        if self.evaluation_model.classification_type in ['binary','multi-label'] and not self.datamodule.dsoversample:
-            self.evaluation_model.criterion = nn.BCEWithLogitsLoss(pos_weight = self.bin_pos_wts)
-        elif self.evaluation_model.classification_type == 'multi-class' and not self.datamodule.dsoversample:
-            self.evaluation_model.criterion = nn.CrossEntropyLoss(weight = self.bin_pos_wts)
+    # ===================================
 
-        #CHANGE SCHEDULER LATER
-        if scheduler == 'steplr':
-            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
-                                                           step_size=1,
-                                                           gamma=0.98,
-                                                           last_epoch=-1,
-                                                           verbose = True)
-        elif scheduler == 'cosine':
-            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
-                                                                       T_max = ds_epochs,
-                                                                       last_epoch=-1,
-                                                                       verbose = True)
-        elif scheduler == 'multistep':
-            lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                                milestones = [int(0.6*ds_epochs), int(0.8*ds_epochs)],
-                                                                gamma = 0.1,
-                                                                verbose = True)
-        self.train_losses, self.valid_losses = np.array([]), np.array([])
-        self.train_accuracy, self.valid_accuracy = np.array([]), np.array([])
-        
-        if self.evaluation_model.classification_type != 'multi-class':
-            if self.datamodule.num_classes == 2 and self.evaluation_model.classification_type == 'binary':
-                self.ds_num_classes = 1
-            elif self.datamodule.num_classes == 2 and self.evaluation_model.classification_type == 'multi-label':
-                self.ds_num_classes = 2
-        else:
-            self.ds_num_classes = self.datamodule.num_classes
+    #applies randomly selected augmentations to each clip (same for each frame in the clip)
+    def augment(self, x):
+        if self.transforms is not None:
+            x = self.transforms(x)
+        # x = self.normalize(x)
+        return x
 
-        for epoch in range(ds_epochs):
-            print("\nEpoch {}".format(epoch+1), flush = True)
-            train_epoch_loss, train_epoch_accuracy = self.train_ds_epoch(self.evaluation_model,
-                                                                        self.train_loader,
-                                                                        optimizer)
+# ================================================================================
 
-            self.writer.add_scalar('/'.join([stage,str(fracs).replace('.','p'),'Loss','train']),train_epoch_loss,epoch)
-            self.writer.add_scalar('/'.join([stage,str(fracs).replace('.','p'),'Accuracy','train']),train_epoch_accuracy,epoch)
-            self.train_losses = np.append(self.train_losses, train_epoch_loss)
-            self.train_accuracy = np.append(self.train_accuracy, train_epoch_accuracy)
-            lr_scheduler.step()
-            val_epoch_loss, val_epoch_accuracy, preds, gts = self.valid_ds_epoch(self.evaluation_model,self.valid_loader)
-            self.valid_losses = np.append(self.valid_losses, val_epoch_loss)
-            self.valid_accuracy = np.append(self.valid_accuracy, val_epoch_accuracy)
+class MRNetDataModule(nn.Module):
+	def __init__(self, 
+				 path : str, 
+				 class_name : str = 'acl', 
+				 plane : str = 'sagittal',
+				 pt_num_frames : int = 4,
+				 ds_num_frames : int = 16,
+				 batch_size : int = 32,
+				 ds_batch_size : int = 1,
+				 transforms : nn.Module = None,
+				 data_dim : int = 224,
+				 dsoversample : bool = True,
+				 dsbinary: bool = True,
+				 **kwargs: Any) -> None :
+		self.mrnet_path = path #'E:/Siladittya_JRF/Dataset/MRNet-v1.0'
+		self.class_name = class_name
+		self.plane = plane
+		self.classes = ['abn', 'acl', 'men']
+		self.planes = ['sagittal', 'coronal', 'axial']
 
-            self.writer.add_scalar('/'.join([stage,str(fracs).replace('.','p'),'Loss','valid']),val_epoch_loss,epoch)
-            self.writer.add_scalar('/'.join([stage,str(fracs).replace('.','p'),'Accuracy','valid']),val_epoch_accuracy, epoch)
-            print("\nTrain Accuracy : {acc:.5f}, Train Loss : {loss:.5f}".format(acc = train_epoch_accuracy, loss = train_epoch_loss), flush = True)
-            print("\nValid Accuracy : {acc:.5f}, Valid Loss : {loss:.5f}".format(acc = val_epoch_accuracy, loss = val_epoch_loss), flush = True)
-            
-            if self.show_valid_metrics:
-                val_perf_metrics = get_performance_metrics(gts, preds, [str(c) for c in list(range(self.ds_num_classes))])
-                print(val_perf_metrics)
+		self.train_dir = os.path.join(self.mrnet_path, 'train')
+		self.valid_dir = os.path.join(self.mrnet_path, 'valid')
+		self.base_dir = self.mrnet_path
 
-            if val_epoch_loss <= min(self.valid_losses):
-                counter = 0
-                if linear_eval:
-                    self.dsfilepath = '/'.join([self.modelsavepath,'_'.join([self.model_name, 'linear_eval', self.datestr, '.pt'])])
-                    torch.save(self.evaluation_model.state_dict(), self.dsfilepath)
-                else:
-                    self.dsfilepath = '/'.join([self.modelsavepath,'_'.join([self.model_name, 'fine_tune', str(fracs).replace('.','p'), self.datestr, '.pt'])])
-                    torch.save(self.evaluation_model.state_dict(), self.dsfilepath)
-            else:
-                counter+=1
-                # if counter>patience:
-                #     print("Stopping Early. No more patience left.")
-                #     break
+		self.pt_num_frames = pt_num_frames
+		self.ds_num_frames = ds_num_frames
+		self.batch_size = batch_size
+		self.ds_batch_size = ds_batch_size
+		self.data_dim = data_dim
+		self.transforms = transforms
+		self.dsoversample = dsoversample
+		self.dsbinary = dsbinary
 
-        #fig = plot_metrics(self.train_losses, self.valid_losses, 'Loss')
-        #fig = plot_metrics(self.train_accuracy, self.valid_accuracy, 'Accuracy')
-        ## LOADING THE BEST MODEL
-        self.evaluation_model.load_state_dict(torch.load(self.dsfilepath))
-        test_loss, test_acc, preds, gts = self.valid_ds_epoch(self.evaluation_model, self.test_loader)
+		if isinstance(self.class_name, list): 
+			if len(self.class_name) > 1:
+				self.num_classes = len(self.class_name)
+				self.classification_type = 'multi-label'
+			if len(self.class_name) == 1:
+				self.num_classes = 2	
+				self.classification_type = 'binary'
+		elif isinstance(self.class_name, str):
+			self.num_classes = 2
+			self.classification_type = 'binary'
 
-        preds = preds.reshape((-1,5)).mean(axis = 1, keepdims = True)
-        gts = gts.reshape((-1,5)).mean(axis = 1, keepdims = True)
-        
-        print(':::::Saving Predictions and One Hot Ground Truth data to \'.npy\' files:::::::')
-        np.save('test_set_preds.npy', preds)
-        np.save('test_set_onehot_gt.npy', gts)
-        
-        print(':::::::::::::::::::::::Class-wise Performance Metrics:::::::::::::::::::::::::')
-        if self.evaluation_model.classification_type != 'multi-class':
-            test_perf_metrics = get_performance_metrics(gts, preds, [str(c) for c in list(range(self.ds_num_classes))])
-            print(test_perf_metrics)
-        else:
-            print("\nTest Accuracy : {acc:.5f}, Test Loss : {loss:.5f}".format(acc = test_acc, loss = test_loss), flush = True)
-        
-        min_ind = np.argmin(self.valid_losses)
-        val_loss_min_ind = self.valid_losses[min_ind]
-        val_acc_min_ind = self.valid_accuracy[min_ind]
-        return {'_'.join([stage,mode,str(fracs).replace('.','p'),'val_loss']):val_loss_min_ind,
-                '_'.join([stage,mode,str(fracs).replace('.','p'),'val_acc']):val_acc_min_ind,
-                '_'.join([stage,mode,str(fracs).replace('.','p'),'test_loss']):test_loss,
-                '_'.join([stage,mode,str(fracs).replace('.','p'),'test_acc']):test_acc}
+		# ==================================================
 
-    def infer_classifier(self,
-                       stage: str,
-                       mode: str,
-                       model: nn.Module,
-                       linear_eval: str,
-                       fracs: float = 1.0
-                      ) -> None:
+		self.trabn = pd.read_csv(os.path.join(self.mrnet_path,'train-abnormal.csv'), header = None)
+		self.tracl = pd.read_csv(os.path.join(self.mrnet_path,'train-acl.csv'), header = None)
+		self.trmen = pd.read_csv(os.path.join(self.mrnet_path,'train-meniscus.csv'), header = None)
 
-        stage = stage
-        mode = mode
-        model = model
-        linear_eval = linear_eval
-        fracs = fracs
+		self.trabn.columns = ['patient_id', 'label']
+		self.tracl.columns = ['patient_id', 'label']
+		self.trmen.columns = ['patient_id', 'label']
 
-        if linear_eval:
-            for n,p in model.named_parameters():
-                if 'fc' not in n:
-                    p.requires_grad = False
-                else:
-                    p.requires_grad = False
-        else:
-            for p in model.parameters():
-                p.requires_grad = False
+		self.tr_multilabel = self.trabn.merge(self.tracl, on = 'patient_id').merge(self.trmen, on = 'patient_id')
+		self.tr_multilabel.columns = ['patient_id', 'abn', 'acl', 'men']
 
-        self.evaluation_model = model #
-        self.datamodule.setup(stage = 'test',pretrain = False)
-        self.test_loader = self.datamodule.test_dataloader(False)
-        
-        if self.evaluation_model.classification_type != 'multi-class':
-            if self.datamodule.num_classes == 2 and self.evaluation_model.classification_type == 'binary':
-                self.ds_num_classes = 1
-            elif self.datamodule.num_classes == 2 and self.evaluation_model.classification_type == 'multi-label':
-                self.ds_num_classes = 2
-        else:
-            self.ds_num_classes = self.datamodule.num_classes
+		# ===================================================
 
-        #fig = plot_metrics(self.train_losses, self.valid_losses, 'Loss')
-        #fig = plot_metrics(self.train_accuracy, self.valid_accuracy, 'Accuracy')
-        ## LOADING THE BEST MODEL
-        self.evaluation_model.load_state_dict(torch.load(self.dsfilepath))
-        test_loss, test_acc, preds, gts = self.valid_ds_epoch(self.evaluation_model, self.test_loader)
-        
-        # print(':::::Saving Predictions and One Hot Ground Truth data to \'.npy\' files:::::::')
-        # np.save('test_set_preds.npy', preds)
-        # np.save('test_set_onehot_gt.npy', gts)
-        
-        print(':::::::::::::::::::::::::::Performance Metrics:::::::::::::::::::::::::::::')
-        if self.evaluation_model.classification_type != 'multi-class':
-            test_perf_metrics = get_performance_metrics(gts, preds, [str(c) for c in list(range(self.ds_num_classes))])
-            print(test_perf_metrics)
-        else:
-            print("\nTest Accuracy : {acc:.5f}, Test Loss : {loss:.5f}".format(acc = test_acc, loss = test_loss), flush = True)
-        
-        return {'_'.join([stage,mode,str(fracs).replace('.','p'),'test_loss']):test_loss,
-                '_'.join([stage,mode,str(fracs).replace('.','p'),'test_acc']):test_acc}
+		self.testabn = pd.read_csv(os.path.join(self.mrnet_path,'valid-abnormal.csv'), header = None)
+		self.testacl = pd.read_csv(os.path.join(self.mrnet_path,'valid-acl.csv'), header = None)
+		self.testmen = pd.read_csv(os.path.join(self.mrnet_path,'valid-meniscus.csv'), header = None)
 
-    def train_ds_epoch(self, model, dataloader, optimizer):
-        model.train()
-        train_losses = 0
-        train_accuracy = 0
-        with tqdm(dataloader, unit = 'batch', total = len(dataloader)) as tepoch:
-            for step, batch in enumerate(tepoch):
-                optimizer.zero_grad(set_to_none = True )
-                train_loss, train_acc, _, _ = model.step(batch, step, False)
-                #self.writer.add_scalar('pretrain/train_loss_step',train_loss)
-                train_loss.backward()
-                optimizer.step()
-                train_losses += train_loss.item()
-                train_accuracy += train_acc
-                tepoch.set_postfix(loss = train_loss.item(), acc = train_accuracy/(step+1))
-        train_losses = train_losses/(step+1)
-        train_accuracy =train_accuracy/(step+1)
-        return train_losses, train_accuracy
+		self.testabn.columns = ['patient_id', 'label']
+		self.testacl.columns = ['patient_id', 'label']
+		self.testmen.columns = ['patient_id', 'label']
 
-    def valid_ds_epoch(self, model, dataloader):
-        model.eval()
-        valid_losses = 0
-        valid_accuracy = 0
-        preds = np.array([]).reshape((0,self.ds_num_classes))
-        gts = np.array([]).reshape((0,self.ds_num_classes))
-        with torch.no_grad():
-            with tqdm(dataloader, unit = 'batch', total = len(dataloader)) as vepoch:
-                for step, batch in enumerate(vepoch):
-                    valid_loss, valid_acc, pred, gt = model.step(batch, step, False)
-                    preds = np.append(preds, pred.numpy(), axis = 0)
-                    if self.evaluation_model.classification_type == 'multi-class':
-                        gt = torch.nn.functional.one_hot(gt, num_classes = self.ds_num_classes)
-                    gts = np.append(gts, gt.numpy(), axis = 0)
-                    #self.writer.add_scalar('pretrain/train_loss_step',train_loss)
-                    valid_losses += valid_loss.item()
-                    valid_accuracy += valid_acc
-                    vepoch.set_postfix(loss = valid_loss.item(), acc = valid_accuracy/(step+1))
-            valid_losses = valid_losses/(step+1)
-            valid_accuracy = valid_accuracy/(step+1)
-        return valid_losses, valid_accuracy, preds, gts
+		self.test_multilabel = self.testabn.merge(self.testacl, on = 'patient_id').merge(self.testmen, on = 'patient_id')
+		self.test_multilabel.columns = ['patient_id', 'abn', 'acl', 'men']
 
-    def knn_eval(self,
-                 dsmodel,
-                 fracs: float = 1.0,
-                 k: int = 200,
-                 weights: str = 'distance',
-                 algorithm: str = 'auto',
-                 metric: str = 'minkowski',
-                 net_model_path: str = None
-                 ) -> Any:
-        print(":::::::::::::::::K-NEAREST NEIGHBOUR CLASSIFICATION::::::::::::::::")
-        if net_model_path is not None:
-            dsmodel.load_state_dict(torch.load(net_model_path), strict = False)
-        else:
-            dsmodel.load_state_dict(torch.load(self.final_net_save_path), strict = False)
+		# ===================================================
+		# ===================================================
 
-        knn_metric = {}
-        for i in range(k, 201, 20):
+		# for c in self.planes:
+		self.tr_filenames_df = pd.DataFrame(columns=['patient_id','filename'])
+		self.tr_filenames_df['filename'] = os.listdir(os.path.join(self.mrnet_path,'train',self.plane))
 
-            metrics = self.knn_downstream('knn_eval',
-                                          dsmodel,
-                                          fracs,
-                                          i,
-                                          weights,
-                                          algorithm,
-                                          metric
-                                          )
-            knn_metric = {**knn_metric, **metrics}
-        return knn_metric
+		self.tr_filenames_df['patient_id'] = self.tr_filenames_df.apply(lambda x : int(x['filename'][:-4]),axis=1)
+		self.tr_filenames_df['filename'] = self.tr_filenames_df.apply(lambda x : os.path.join(self.mrnet_path,'train',self.plane,x['filename']),axis=1)
 
-    def knn_cossim(self,
-                 test_X,
-                 train_X,
-                 test_y,
-                 train_y,
-                 k,
-                 temperature):
-        # compute cos similarity between each feature vector and feature bank ---> [B, N]
-        test_X = torch.nn.functional.normalize(test_X, dim = -1)
-        train_X = torch.nn.functional.normalize(train_X, dim = -1)
-        sim_matrix = torch.mm(test_X, train_X.t())
-        # [B, K]
-        sim_weight, sim_indices = sim_matrix.topk(k=k, dim=-1)
-        # [B, K]
-        sim_labels = torch.gather(train_y.expand(test_X.shape[0], -1), dim=-1, index=sim_indices)
-        sim_weight = (sim_weight / temperature).exp()
+		self.tr_filenames_df = self.tr_filenames_df[list(('patient_id','filename'))]
+		self.tr_filenames_df.sort_values(by=['patient_id'],ascending=True,inplace=True,ignore_index=True)
+		self.tr_df = self.tr_filenames_df.merge(self.tr_multilabel, on = 'patient_id')
 
-        # counts for each class
-        one_hot_label = torch.zeros(test_X.shape[0] * k, self.ds_num_classes, device=sim_labels.device)
-        # [B*K, C]
-        one_hot_label = one_hot_label.scatter(dim=-1, index=sim_labels.to(torch.int64).view(-1, 1), value=1.0)
-        # weighted score ---> [B, C]
-        pred_scores = torch.sum(one_hot_label.view(test_X.shape[0], -1, self.ds_num_classes) * sim_weight.unsqueeze(dim=-1), dim=1)
+		self.tr_df, self.val_df = train_test_split(self.tr_df, test_size = 0.1)
 
-        pred_labels = pred_scores.argsort(dim=-1, descending=True)
+		# print(np.count_nonzero(self.val_df['acl'].values))
 
-        return pred_labels
+		# ===================================================
+		
+		self.test_filenames_df = pd.DataFrame(columns=['patient_id','filename'])
+		self.test_filenames_df['filename'] = os.listdir(os.path.join(self.mrnet_path,'valid',self.plane))
 
-    def knn_downstream(self,
-                   stage: str,
-                   model: nn.Module,
-                   fracs: float = 1.0,
-                   k: int = 200,
-                   weights: str = 'distance',
-                   algorithm: str = 'auto',
-                   metric: str = 'minkowski'
-                  ) -> None:
+		self.test_filenames_df['patient_id'] = self.test_filenames_df.apply(lambda x : int(x['filename'][:-4]),axis=1)
+		self.test_filenames_df['filename'] = self.test_filenames_df.apply(lambda x : os.path.join(self.mrnet_path,'valid',self.plane,x['filename']),axis=1)
 
-        stage = stage
-        #model = model
-        
-        #for p in model.parameters():
-        #    p.requires_grad = False
-        #if not linear_eval:
-        #    for p in model.net.base_encoder.parameters():
-        #        p.requires_grad = True
+		self.test_filenames_df = self.test_filenames_df[list(('patient_id','filename'))]
+		self.test_filenames_df.sort_values(by=['patient_id'],ascending=True,inplace=True,ignore_index=True)
+		self.test_df = self.test_filenames_df.merge(self.test_multilabel, on = 'patient_id')
+		# ===================================================
 
-        fracs = fracs
-        self.knn_n_neighbors = k
-        self.knn_weights = weights
-        self.knn_algorithm = algorithm
-        self.knn_metric = metric
-        counter = 0
+	def setup(self, stage: Optional[str] = None, pretrain : Optional[bool] = True, fracs: Optional[float] = 1.0):
+		#transforms
+		if stage == 'train':
+			self.train_transforms = self.transforms
+			if pretrain:
+				self.traingen = SSLDataFrameDataset('train', self.tr_df, self.class_name, self.pt_num_frames, self.train_transforms)
+			else:
+				self.traingen = SLDataFrameDataset('train', 
+													self.tr_df, 
+													self.class_name, 
+													self.ds_num_frames, 
+													transforms.RandomResizedCrop(self.data_dim,(0.8,1.0)), 
+													fracs,
+													self.dsoversample,
+													self.dsbinary)
 
-        self.evaluation_model = model #
-        preds_shape = self.evaluation_model.base_encoder.fc.in_features
-        #model.base_encoder.fc = nn.Identity()
-        
-        self.datamodule.setup(stage = 'train',pretrain = False, fracs = fracs)
-        self.datamodule.setup(stage = 'valid',pretrain = False)
-        self.train_loader = self.datamodule.train_dataloader(False)
-        self.valid_loader = self.datamodule.valid_dataloader(False)
-        self.datamodule.setup(stage = 'test',pretrain = False)
-        self.test_loader = self.datamodule.test_dataloader(False)
+		if stage == 'valid':
+			self.valid_transforms = transforms.Compose([transforms.RandomResizedCrop(self.data_dim,(0.8,1.0))])
+			# #None 
+			#transforms.Compose([transforms.Normalize(self.MEAN, self.STD)])
+			if pretrain:
+				self.validgen = SSLDataFrameDataset('valid', self.val_df, self.class_name, self.pt_num_frames, self.valid_transforms) #torchvision.transforms.RandomResizedCrop(32,(0.8,1.0))
+			else:
+				self.validgen = SLDataFrameDataset('valid', self.val_df, self.class_name, self.ds_num_frames, self.valid_transforms) #torchvision.transforms.RandomResizedCrop(32,(0.8,1.0))
 
+		if stage == 'test':
+			self.test_transforms = transforms.Compose([transforms.RandomResizedCrop(self.data_dim,(0.8,1.0))])
+			#None 
+			#transforms.Compose([transforms.Normalize(self.MEAN, self.STD)])
+			if pretrain:
+				self.testgen = SSLDataFrameDataset('test', self.test_df, self.class_name, self.ds_num_frames, self.test_transforms)
+			else:
+				self.testgen = SLDataFrameDataset('test', self.test_df, self.class_name, self.ds_num_frames, self.test_transforms)
 
-        self.train_losses, self.valid_losses = np.array([]), np.array([])
-        self.train_accuracy, self.valid_accuracy = np.array([]), np.array([])
-        
-        if self.evaluation_model.classification_type != 'multi-class':
-            if self.datamodule.num_classes == 2 and self.evaluation_model.classification_type == 'binary':
-                self.ds_num_classes = 1
-            elif self.datamodule.num_classes == 2 and self.evaluation_model.classification_type == 'multi-label':
-                self.ds_num_classes = 2
-        else:
-            self.ds_num_classes = self.datamodule.num_classes
+	def train_dataloader(self, pretrain : Optional[bool] = True):
+		if pretrain:
+			trainloader = DataLoader(self.traingen, batch_size = self.batch_size, shuffle = True, drop_last = True)
+		else:
+			trainloader = DataLoader(self.traingen, batch_size = self.ds_batch_size, shuffle = True, drop_last = True)
+		return trainloader
 
-        
-        self.evaluation_model.eval()
-        with torch.no_grad():
-            tpreds = np.array([]).reshape((0,preds_shape))
-            tgts = np.array([]) #.reshape((0,self.ds_num_classes))
-            with tqdm(self.train_loader, unit = 'batch', total = len(self.train_loader)) as tepoch:
-                for step, batch in enumerate(tepoch):
-                    #x, y = batch #[b.cuda() for b in batch]
-                    #z = self.evaluation_model.base_encoder(x.cuda()).cpu()
-                    z, y = self.evaluation_model.step(batch, step, True)
-                    tpreds = np.append(tpreds, z.numpy(), axis = 0)
-                    #if self.evaluation_model.classification_type == 'multi-class':
-                    #    y = torch.nn.functional.one_hot(y, num_classes = self.ds_num_classes)
-                    tgts = np.append(tgts, y.numpy(), axis = 0)
+	def valid_dataloader(self, pretrain : Optional[bool] = True):
+		if pretrain:
+			validloader = DataLoader(self.validgen, batch_size = self.ds_batch_size, drop_last = True)
+		else:
+			validloader = DataLoader(self.validgen, batch_size = self.ds_batch_size, drop_last = True)
+		return validloader
 
-            vpreds = np.array([]).reshape((0, preds_shape)) #self.ds_num_classes))
-            vgts = np.array([])#.reshape((0,self.ds_num_classes))
-            with tqdm(self.test_loader, unit = 'batch', total = len(self.test_loader)) as vepoch:
-                for step, batch in enumerate(vepoch):
-                    #x, y = batch #[b.cuda() for b in batch]
-                    #z = self.evaluation_model.base_encoder(x.cuda()).cpu()
-                    z, y = self.evaluation_model.step(batch, step, True)
-                    vpreds = np.append(vpreds, z.numpy(), axis = 0)
-                    #if self.evaluation_model.classification_type == 'multi-class':
-                    #    y = torch.nn.functional.one_hot(y, num_classes = self.ds_num_classes)
-                    vgts = np.append(vgts, y.numpy(), axis = 0)
+	def test_dataloader(self, pretrain : Optional[bool] = True):
+		if pretrain:
+			testloader = DataLoader(self.testgen, batch_size = self.ds_batch_size, drop_last = True)
+		else:
+			testloader = DataLoader(self.testgen, batch_size = self.ds_batch_size, drop_last = True)
+		return testloader
 
-        if self.knn_weights !='cosinesimilarity':
+class RSNABraTSModule(nn.Module):
+	def __init__(self, 
+				 path : str, 
+				 class_name : str = 'MGMT_value', 
+				 plane : str = 'T1w',
+				 pt_num_frames : int = 16,
+				 ds_num_frames : int = 16,
+				 batch_size : int = 4,
+				 ds_batch_size : int = 4,
+				 transforms : nn.Module = None,
+				 data_dim : int = 224,
+				 dsoversample : bool = True,
+				 dsbinary: bool = True,
+				 **kwargs: Any) -> None :
+		self.rsna_path = path #'E:/Siladittya_JRF/Dataset/MRNet-v1.0'
+		self.class_name = class_name
+		self.plane = plane
+		self.classes = ['1', '0']
+		self.planes = ['FLAIR', 'T1w', 'T1wCE','T2w']
 
-            knnclf = KNeighborsClassifier(n_neighbors = self.knn_n_neighbors, 
-                                          weights = self.knn_weights,
-                                          algorithm = self.knn_algorithm,
-                                          metric = self.knn_metric)
-            tgts = tgts[~np.isnan(tpreds)[:,0]]
-            tpreds = tpreds[~np.isnan(tpreds)[:,0]]
-            _ = knnclf.fit(tpreds, tgts)
-            # print(vpreds)
-            vgts = vgts[~np.isnan(vpreds)[:,0]]
-            vpreds = vpreds[~np.isnan(vpreds)[:,0]]
-            test_acc = knnclf.score(vpreds, vgts)
+		self.train_dir = os.path.join(self.rsna_path, 'train')
+		self.test_dir = os.path.join(self.rsna_path, 'test')
+		self.base_dir = self.rsna_path
 
-        else:
-            pred_labels = self.knn_cossim(torch.from_numpy(vpreds), 
-                                        torch.from_numpy(tpreds), 
-                                        torch.from_numpy(vgts), 
-                                        torch.from_numpy(tgts), 
-                                        self.knn_n_neighbors, 0.5)
-            test_acc = torch.sum((pred_labels[:, :1] == torch.from_numpy(vgts).unsqueeze(dim=-1)).any(dim=-1).float()).item()
-            test_acc = test_acc/vgts.shape[0]
-            #total_top5 += torch.sum((pred_labels[:, :5] == target.unsqueeze(dim=-1)).any(dim=-1).float()).item()
-            #test_bar.set_description('Test Epoch: [{}/{}] Acc@1:{:.2f}% Acc@5:{:.2f}%'
-            #                     .format(epoch, args.epochs, total_top1 / total_num * 100, total_top5 / total_num * 100))
+		self.exclude_ids = ['00109', '00123', '00709']
 
-        self.writer.add_scalar('/'.join([stage,str(fracs).replace('.','p'),'k']),k)
-        
-    
-        # print(':::::Saving Predictions and Ground Truth data to \'.npy\' files:::::::')
-        # np.save('knn_test_set_preds.npy', vpreds)
-        # np.save('knn_test_set_onehot_gt.npy', vgts)
-        
-        print(':::::::::::::::::::::::::::::Performance Metrics:::::::::::::::::::::::::::::')
-        if self.evaluation_model.classification_type != 'multi-class':
-            test_perf_metrics = get_performance_metrics(gts, preds, [str(c) for c in list(range(self.ds_num_classes))])
-            print(test_perf_metrics)
-        else:
-            print("\nFor k = {k:.1f} - Test Accuracy : {acc:.5f}".format(k = k, acc = test_acc, flush = True))
-        
-        return {'_'.join([stage,'k='+str(k),str(fracs).replace('.','p'),'test_acc']):test_acc}
+		self.pt_num_frames = pt_num_frames
+		self.ds_num_frames = ds_num_frames
+		self.batch_size = batch_size
+		self.ds_batch_size = ds_batch_size
+		self.data_dim = data_dim
+		self.transforms = transforms
+		self.dsoversample = dsoversample
+		self.dsbinary = dsbinary
 
-    def extract_embeddings(self,
-                           model,
-                           model_path,
-                           dataloader,
-                           writer):
-        if model_path is None:
-            model.load_state_dict(torch.load(self.final_net_save_path), strict = False)
-        else:
-            model.load_state_dict(torch.load(model_path), strict = False)
+		# if isinstance(self.class_name, list): 
+		# 	if len(self.class_name) > 1:
+		# 		self.num_classes = len(self.class_name)
+		# 		self.classification_type = 'multi-label'
+		# 	if len(self.class_name) == 1:
+		# 		self.num_classes = 2	
+		# 		self.classification_type = 'binary'
+		# elif isinstance(self.class_name, str):
+		self.num_classes = 2
+		self.classification_type = 'binary'
 
-        features = None
-        labels = None
-        labels_img = None
-        with torch.no_grad():
-            for x,y in dataloader:
-                feats = model(x.cuda(non_blocking = True))
-                if features == None:
-                    features = feats.cpu().numpy()
-                    labels = y
-                    label_img = x.cpu().numpy().transpose(0,2,3,1)
-                else:
-                    features = np.append(features, feats.cpu().numpy(), axis = 0)
-                    labels = np.append(labels, y, axis = 0)
-                    labels_img = np.append(label_img, x.cpu().numpy().transpose(0,2,3,1), axis = 0)
-        writer.add_embedding(features = features, metadata = labels, label_img = label_img)
+		self.brats21_ids = os.listdir(self.train_dir)
 
+		self.train_df = pd.read_csv(os.path.join(self.base_dir, 'train_labels.csv'))
+		self.train_df['filepath'] = self.train_df['BraTS21ID'].apply(lambda x:os.path.join(self.train_dir, str(x).zfill(5), self.plane))
+		self.train_df = self.train_df[~self.train_df['BraTS21ID'].isin(list(map(int,self.exclude_ids)))]
+		self.test_df = pd.DataFrame(columns = ['BraTS21ID', 'MGMT_value'])
+		self.test_df['BraTS21ID'] = list(map(int, os.listdir(self.test_dir)))
 
+		# print(self.train_df)
+		# print(self.test_df)
+		# =================================================
+		self.train_df, self.valid_df = train_test_split(self.train_df, test_size = 0.1)
+		# ===================================================
+		# ===================================================
 
+	def setup(self, stage: Optional[str] = None, pretrain : Optional[bool] = True, fracs: Optional[float] = 1.0):
+		#transforms
+		if stage == 'train':
+			self.train_transforms = self.transforms
+			if pretrain:
+				self.traingen = SSLDataFrameDataset('train', self.train_df, self.class_name, self.pt_num_frames, self.train_transforms)
+			else:
+				self.traingen = SLDataFrameDataset('train', 
+													self.train_df, 
+													self.class_name, 
+													self.ds_num_frames, 
+													transforms.RandomResizedCrop(self.data_dim,(0.8,1.0)), 
+													fracs,
+													self.dsoversample,
+													self.dsbinary)
 
+		if stage == 'valid':
+			self.valid_transforms = transforms.Compose([transforms.RandomResizedCrop(self.data_dim,(0.8,1.0))])
+			# #None 
+			#transforms.Compose([transforms.Normalize(self.MEAN, self.STD)])
+			if pretrain:
+				self.validgen = SSLDataFrameDataset('valid', self.valid_df, self.class_name, self.pt_num_frames, self.valid_transforms) #torchvision.transforms.RandomResizedCrop(32,(0.8,1.0))
+			else:
+				self.validgen = SLDataFrameDataset('valid', self.valid_df, self.class_name, self.ds_num_frames, self.valid_transforms) #torchvision.transforms.RandomResizedCrop(32,(0.8,1.0))
+
+		if stage == 'test':
+			self.test_transforms = transforms.Compose([transforms.RandomResizedCrop(self.data_dim,(0.8,1.0))])
+			#None 
+			#transforms.Compose([transforms.Normalize(self.MEAN, self.STD)])
+			if pretrain:
+				self.testgen = SSLDataFrameDataset('test', self.test_df, self.class_name, self.ds_num_frames, self.test_transforms)
+			else:
+				self.testgen = SLDataFrameDataset('test', self.test_df, self.class_name, self.ds_num_frames, self.test_transforms)
+
+	def train_dataloader(self, pretrain : Optional[bool] = True):
+		if pretrain:
+			trainloader = DataLoader(self.traingen, batch_size = self.batch_size, shuffle = True, drop_last = True)
+		else:
+			trainloader = DataLoader(self.traingen, batch_size = self.ds_batch_size, shuffle = True, drop_last = True)
+		return trainloader
+
+	def valid_dataloader(self, pretrain : Optional[bool] = True):
+		if pretrain:
+			validloader = DataLoader(self.validgen, batch_size = self.ds_batch_size, drop_last = True)
+		else:
+			validloader = DataLoader(self.validgen, batch_size = self.ds_batch_size, drop_last = True)
+		return validloader
+
+	def test_dataloader(self, pretrain : Optional[bool] = True):
+		if pretrain:
+			testloader = DataLoader(self.testgen, batch_size = self.ds_batch_size, drop_last = True)
+		else:
+			testloader = DataLoader(self.testgen, batch_size = self.ds_batch_size, drop_last = True)
+		return testloader
