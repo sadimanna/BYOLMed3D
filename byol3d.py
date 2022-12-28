@@ -11,6 +11,7 @@ from schedulers import LinearWarmupCosineAnnealingLR
 from lars import LARS
 from losses import BYOLLoss
 from utils import seed_everything
+import torchmetrics
 
 import matplotlib.pyplot as plt
 
@@ -51,9 +52,9 @@ class BYOLNet(nn.Module):
         self.base_encoder = models.video.r3d_18()
         dim_infeat = self.base_encoder.fc.weight.shape[1]
         self.base_encoder.fc = Identity()
-        if self.data_dims.split('x')[0] == '32':
-            self.base_encoder.conv1 = nn.Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), bias=False)
-            self.base_encoder.maxpool = Identity()
+        # if self.data_dims.split('x')[0] == '32':
+        #     self.base_encoder.conv1 = nn.Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), bias=False)
+        #     self.base_encoder.maxpool = Identity()
 
         for p in self.base_encoder.parameters():
             p.requires_grad = True
@@ -197,7 +198,7 @@ class BYOLModel(nn.Module):
 
     def update_target_encoder_momentum(self):
         self.m = 1 - (1-self.base_m)*(np.cos(np.pi*self.global_step/self.max_training_steps) + 1)/2
-        self.global_step += 1
+        self.global_step += 1//self.acc_iters
 
     @torch.no_grad()
     def _momentum_update_target_encoder(self):
@@ -205,25 +206,29 @@ class BYOLModel(nn.Module):
         Momentum update of the key encoder
         """
         self.update_target_encoder_momentum()
-        for param_o, param_t in zip(self.net.parameters(), self.net_t.parameters()):
-            param_t.data = param_t.data * self.m + param_o.data * (1. - self.m)
+        if self.global_step % self.acc_iters == 0:
+            for param_o, param_t in zip(self.net.parameters(), self.net_t.parameters()):
+                param_t.data = param_t.data * self.m + param_o.data * (1. - self.m)
 
-    def forward(self, im_o, im_t, update_mom = False):
-        # compute query features
+    # def forward(self, im_o, im_t, update_mom = False):
+    #     # compute query features
+    #     e1, o1 = self.net(im_o)
+    #     _, t1 = self.net(im_t)
+    #     # queries: NxC
+    #     # compute key features
+    #     with torch.no_grad():  # no gradient to keys
+    #         if update_mom:
+    #             self._momentum_update_target_encoder()  # update the key encoder
+    #         # shuffle for making use of BN
+    #         #im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
+    #         _, o2 = self.net_t(im_o)
+    #         _, t2 = self.net_t(im_t)  # keys: NxC
+    #         # undo shuffle
+    #         #k = self._batch_unshuffle_ddp(k, idx_unshuffle)
+    #     return e1, (o1, t1), (o2, t2)
+    def forward(self, x):
         e1, o1 = self.net(im_o)
-        _, t1 = self.net(im_t)
-        # queries: NxC
-        # compute key features
-        with torch.no_grad():  # no gradient to keys
-            if update_mom:
-                self._momentum_update_target_encoder()  # update the key encoder
-            # shuffle for making use of BN
-            #im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
-            _, o2 = self.net_t(im_o)
-            _, t2 = self.net_t(im_t)  # keys: NxC
-            # undo shuffle
-            #k = self._batch_unshuffle_ddp(k, idx_unshuffle)
-        return e1, (o1, t1), (o2, t2)
+        return o1
 
     def configure_optimizers(self):
         if self.bn_bias_lr is not None:
@@ -312,20 +317,46 @@ class BYOLModel(nn.Module):
 
         return optimizer, scheduler
 
-    def step(self, stage, batch, batch_idx, update_mom, summary_writer = None):
-        x1, x2, y = [b.cuda(non_blocking = True) for b in batch]
-        # plt.imshow(x1.cpu().numpy()[0,:,0,:,:].transpose(1,2,0)*0.1087 + 0.1593)
-        # plt.show()
-        #  pass throught net
-        e1, (o1, t1), (o2, t2) = self(x1, x2, update_mom)
-        # print(o1)
-        #print(q.shape,k.shape)
-        loss1 = self.criterion(o1, t2, batch_idx, summary_writer, stage)        
-        loss2 = self.criterion(t1, o2, batch_idx, summary_writer, stage)
-        loss = loss1 + loss2
-        #print(loss)
-        #  self.log('train_loss_ssl',loss, on_epoch = True, logger = True)
-        if stage == 'train':
-            return loss
-        else:
-            return e1.cpu().numpy(), y.cpu().numpy(), loss #.cpu().item()
+    # def step(self, stage, batch, batch_idx, update_mom, summary_writer = None):
+    #     x1, x2, y = [b.cuda(non_blocking = True) for b in batch]
+    #     # plt.imshow(x1.cpu().numpy()[0,:,0,:,:].transpose(1,2,0)*0.1087 + 0.1593)
+    #     # plt.show()
+    #     #  pass throught net
+    #     e1, (o1, t1), (o2, t2) = self(x1, x2, update_mom)
+    #     # print(o1)
+    #     #print(q.shape,k.shape)
+    #     loss1 = self.criterion(o1, t2, batch_idx, summary_writer, stage)        
+    #     loss2 = self.criterion(t1, o2, batch_idx, summary_writer, stage)
+    #     loss = loss1 + loss2
+    #     #print(loss)
+    #     #  self.log('train_loss_ssl',loss, on_epoch = True, logger = True)
+    #     if stage == 'train':
+    #         return loss
+    #     else:
+    #         return e1.cpu().numpy(), y.cpu().numpy(), loss #.cpu().item()
+
+    def training_step(self, batch, batch_idx):
+        # utils.update_momentum(self.backbone, self.backbone_momentum, m=0.99)
+        # utils.update_momentum(self.projection_head, self.projection_head_momentum, m=0.99)
+        self._momentum_update_target_encoder()  # update the key encoder
+        (x0, x1), _, _ = batch
+        p0 = self.net(x0)
+        z0 = self.net_t(x0)
+        p1 = self.net(x1)
+        z1 = self.net_t(x1)
+        loss = 0.5 * (self.criterion(p0, z1) + self.criterion(p1, z0))
+        self.log('train_loss_ssl', loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        # utils.update_momentum(self.backbone, self.backbone_momentum, m=0.99)
+        # utils.update_momentum(self.projection_head, self.projection_head_momentum, m=0.99)
+        # self._momentum_update_target_encoder()  # update the key encoder
+        (x0, x1), _, _ = batch
+        p0 = self.net(x0)
+        z0 = self.net_t(x0)
+        p1 = self.net(x1)
+        z1 = self.net_t(x1)
+        loss = 0.5 * (self.criterion(p0, z1) + self.criterion(p1, z0))
+        self.log('valid_loss_ssl', loss)
+        return loss

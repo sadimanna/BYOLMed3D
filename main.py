@@ -28,6 +28,35 @@ import byol3d
 from trainer import Trainer
 from utils import run_command
 
+import copy
+import os
+
+import time
+import lightly
+import multiprocessing as mp
+import pytorch_lightning as pl
+import torchvision
+from lightly.models import modules
+from lightly.models.modules import heads
+from lightly.models import utils
+from lightly.utils import BenchmarkModule
+from pytorch_lightning.loggers import TensorBoardLogger
+
+logs_root_dir = os.path.join(os.getcwd(), 'benchmark_logs')
+# Set to True to enable Distributed Data Parallel training.
+distributed = False
+
+# Set to True to enable Synchronized Batch Norm (requires distributed=True). 
+# If enabled the batch norm is calculated over all gpus, otherwise the batch
+# norm is only calculated from samples on the same gpu.
+sync_batchnorm = False
+
+# Set to True to gather features from all gpus before calculating 
+# the loss (requires distributed=True).
+# If enabled then the loss on every gpu is calculated with features from all 
+# gpus, otherwise only features from the same gpu are used.
+gather_distributed = False 
+
 np.random.seed(1234)
 torch.manual_seed(1234)
 
@@ -146,7 +175,8 @@ if __name__ == '__main__':
 	# mrnet_path = 'E:/Siladittya_JRF/Dataset/MRNet-v1.0'
 
 	# =============================================================================
-    model = byol3d.BYOLModel(**dict_args)
+    benchmark_model = byol3d.BYOLModel(**dict_args)
+    benchmark_model.acc_iters = args.pretrain_batch_size//args.acc_bs
     transforms_ = BYOLTransform(int(args.data_dims.split('x')[0]))
 
     if args.dataset == 'mrnet':
@@ -179,51 +209,187 @@ if __name__ == '__main__':
                              dsbinary = True)
 
     # =============================================================================
-
+    runs = []
+    dm.setup(stage = 'train',pretrain = True)
+    dm.setup(stage = 'valid',pretrain = True)
+    train_loader = dm.train_dataloader(True)
+    valid_loader = dm.valid_dataloader(True)
     # RELOAD MODELS IF RESUME TRUE
     if args.resume:
         state = torch.load(args.model_path)
         model.load_state_dict(state['model_state_dict'])
 
     # =============================================================================
+    model_name = 'byol3d'
+    bench_results = dict()
+    experiment_version = None
 
-    trainer = Trainer(run_num = args.run_num,
-    				  model = model,
-                      datamodule = dm,
-                      grad_acc = args.grad_acc,
-                      acc_bs = args.acc_bs,
-                      max_epochs = args.max_epochs,
-                      train_epochs = args.train_epochs,
-                      lineval_epochs = args.lineval_epochs,
-                      lineval_optim = args.lineval_optim,
-                      lineval_lr = args.lineval_lr,
-                      lineval_momentum = args.lineval_momentum,
-                      lineval_wd = args.lineval_wd,
-                      lineval_lr_schedule = args.lineval_lr_schedule,
-                      finetune_epochs = args.finetune_epochs,
-                      finetune_lr = args.finetune_lr,
-                      finetune_momentum = args.finetune_momentum,
-                      finetune_wd = args.finetune_wd,
-                      finetune_lr_schedule = args.finetune_lr_schedule,
-                      modelsavepath = args.modelsavepath,
-                      modelsaveinterval = args.modelsaveinterval,
-                      resume = args.resume,
-                      model_path = args.model_path,
-                      ft_fc_lr = args.ft_fc_lr,
-                      lowest_val_eval = args.lowest_val_eval
-                      )
+    sub_dir = model_name if n_runs <= 1 else f'{model_name}/run{seed}'
+    logger = TensorBoardLogger(
+                save_dir=os.path.join(logs_root_dir, args.dataset),
+                name='',
+                sub_dir=sub_dir,
+                version=experiment_version,
+            )
+    if experiment_version is None:
+        # Save results of all models under same version directory
+        experiment_version = logger.version
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        dirpath=os.path.join(logger.log_dir, 'checkpoints'),
+        every_n_epochs = 50,
+        save_top_k = -1
+    )
+    trainer = pl.Trainer(
+        max_epochs=args.max_epochs, 
+        gpus= args.gpus,
+        default_root_dir=logs_root_dir,
+        strategy=distributed_backend,
+        sync_batchnorm=sync_batchnorm,
+        logger=logger,
+        accumulate_grad_batches = args.pretrain_batch_size//args.acc_bs,
+        callbacks=[checkpoint_callback])#, GradCallback()]
+    #)
+    start = time.time()
+    trainer.fit(
+        benchmark_model,
+        train_dataloaders=train_loader,
+        val_dataloaders=valid_loader
+    )
+    end = time.time()
+    run = {
+        'model': model_name,
+        'batch_size': args.batch_size,
+        'epochs': args.max_epochs,
+        'runtime': end - start,
+        'gpu_memory_usage': torch.cuda.max_memory_allocated(),
+        'seed': seed,
+    }
+    runs.append(run)
+    print(run)
 
-    # =============================================================================
+    # delete model and trainer + free up cuda memory
+    del benchmark_model
+    del trainer
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+    
+    bench_results[model_name] = runs
 
+    # print results table
+    header = (
+        f"| {'Model':<13} | {'Batch Size':>10} | {'Epochs':>6} "
+        f"| {'Time':>10} | {'Peak GPU Usage':>14} |"
+    )
+    print('-' * len(header))
+    print(header)
+    print('-' * len(header))
+    for model, results in bench_results.items():
+        runtime = np.array([result['runtime'] for result in results])
+        runtime = runtime.mean() / 60 # convert to min
+        # accuracy = np.array([result['max_accuracy'] for result in results])
+        gpu_memory_usage = np.array([result['gpu_memory_usage'] for result in results])
+        gpu_memory_usage = gpu_memory_usage.max() / (1024**3) # convert to gbyte
 
-    trainer.fit()
+        # if len(accuracy) > 1:
+            # accuracy_msg = f"{accuracy.mean():>8.3f} +- {accuracy.std():>4.3f}"
+        # else:
+            # accuracy_msg = f"{accuracy.mean():>18.3f}"
+
+        print(
+            f"| {model:<13} | {args.batch_size:>10} | {args. max_epochs:>6} "
+            f"| {runtime:>6.1f} Min "
+            f"| {gpu_memory_usage:>8.1f} GByte |",
+            flush=True
+        )
+    print('-' * len(header))
 
     # =============================================================================
     #BUILD A MODEL FOR THE DOWNSTREAM TASK
+    print("=============================")
+    print("|  STARTING DOWNSTREAM TASK |")
+    print("=============================")
     ds_model = ClassificationModel(args.base_encoder_name,
                                    dm.num_classes, 
                                    args.data_dims,
                                    classification_type = 'binary').to('cuda:0')
+
+    dm.setup(stage = 'train',pretrain = False)
+    dm.setup(stage = 'valid',pretrain = False)
+    train_loader = dm.train_dataloader(False)
+    valid_loader = dm.valid_dataloader(False)
+    runs = []
+    bench_results = dict()
+
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        dirpath=os.path.join(logger.log_dir, 'checkpoints'),
+        every_n_epochs = 50,
+        save_top_k = -1
+    )
+    trainer = pl.Trainer(
+        max_epochs=args.max_epochs, 
+        gpus= args.gpus,
+        default_root_dir=logs_root_dir,
+        strategy=distributed_backend,
+        sync_batchnorm=sync_batchnorm,
+        logger=logger,
+        accumulate_grad_batches = args.ds_batch_size//args.acc_bs,
+        callbacks=[checkpoint_callback])#, GradCallback()]
+    #)
+    start = time.time()
+    trainer.fit(
+        ds_model,
+        train_dataloaders=train_loader,
+        val_dataloaders=valid_loader
+    )
+    end = time.time()
+    run = {
+        'model': model_name,
+        'batch_size': args.batch_size,
+        'epochs': args.max_epochs,
+        'runtime': end - start,
+        'gpu_memory_usage': torch.cuda.max_memory_allocated(),
+        'seed': seed,
+    }
+    runs.append(run)
+    print(run)
+
+    # delete model and trainer + free up cuda memory
+    # del benchmark_model
+    # del trainer
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+    
+    bench_results[model_name] = runs
+
+    # print results table
+    header = (
+        f"| {'Model':<13} | {'Batch Size':>10} | {'Epochs':>6} "
+        f"| {'Test Accuracy':>18} | {'Time':>10} | {'Peak GPU Usage':>14} |"
+    )
+    print('-' * len(header))
+    print(header)
+    print('-' * len(header))
+    for model, results in bench_results.items():
+        runtime = np.array([result['runtime'] for result in results])
+        runtime = runtime.mean() / 60 # convert to min
+        # accuracy = np.array([result['max_accuracy'] for result in results])
+        gpu_memory_usage = np.array([result['gpu_memory_usage'] for result in results])
+        gpu_memory_usage = gpu_memory_usage.max() / (1024**3) # convert to gbyte
+
+        if len(accuracy) > 1:
+            accuracy_msg = f"{accuracy.mean():>8.3f} +- {accuracy.std():>4.3f}"
+        else:
+            accuracy_msg = f"{accuracy.mean():>18.3f}"
+
+        print(
+            f"| {model:<13} | {args.batch_size:>10} | {args. max_epochs:>6} "
+            f"| {accuracy_msg} | {runtime:>6.1f} Min "
+            f"| {gpu_memory_usage:>8.1f} GByte |",
+            flush=True
+        )
+    print('-' * len(header))
+
+    trainer.test(dataloaders=valid_loader)
 
     # =============================================================================
     #KNN EVALUATION
@@ -241,25 +407,25 @@ if __name__ == '__main__':
 
     # =============================================================================
     #FINE TUNING
-    fine_tune_metrics = trainer.fine_tune(ds_model)
+    # fine_tune_metrics = trainer.fine_tune(ds_model)
 
-    # =============================================================================
+    # # =============================================================================
 
-    metrics_dict = {**fine_tune_metrics} # {**knn_eval_metrics, **lin_eval_metrics, 
-    # print(metrics_dict)
-    # print(dict_args)
+    # metrics_dict = {**fine_tune_metrics} # {**knn_eval_metrics, **lin_eval_metrics, 
+    # # print(metrics_dict)
+    # # print(dict_args)
 
-    # =============================================================================
+    # # =============================================================================
 
-    trainer.writer.add_hparams(dict_args, metrics_dict,
-                                run_name = '_'.join([args.model_name,
-                                                    args.base_encoder_name,
-                                                    args.optimizer,'lr',str(args.lr),
-                                                    'bs',str(args.pretrain_batch_size),
-                                                    'ep',str(args.train_epochs), date]))
+    # trainer.writer.add_hparams(dict_args, metrics_dict,
+    #                             run_name = '_'.join([args.model_name,
+    #                                                 args.base_encoder_name,
+    #                                                 args.optimizer,'lr',str(args.lr),
+    #                                                 'bs',str(args.pretrain_batch_size),
+    #                                                 'ep',str(args.train_epochs), date]))
 
-    # =============================================================================
+    # # =============================================================================
 
-    trainer.writer.close()
+    # trainer.writer.close()
 
     # =============================================================================
